@@ -11,6 +11,7 @@ import socket
 import sqlite3
 import sys
 import time
+from contextvars import ContextVar
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
@@ -33,7 +34,9 @@ if (ROOT / ".env").exists():
         if k.strip() and not k.lstrip().startswith("#"):
             os.environ.setdefault(k.strip(), v.strip())
 
-ALLOWED = {int(x) for x in re.findall(r"\d+", os.getenv("ALLOWED_USERS", ""))}
+_ids = [int(x) for x in re.findall(r"\d+", os.getenv("ALLOWED_USERS", ""))]
+ALLOWED = set(_ids)
+ADMIN = _ids[0] if _ids else None  # первый id в ALLOWED_USERS — управляет общими прокси
 INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
 PROXY_LIST = [p.strip() for p in os.getenv("PROXIES", "").split(",") if p.strip()]  # общий прокси для всех площадок
 PROXIES = itertools.cycle(PROXY_LIST or [None])
@@ -67,7 +70,7 @@ create table if not exists tasks(
 create table if not exists seen(task_id int, item_id text, ts real, primary key(task_id, item_id));
 create table if not exists hidden(chat_id int, site text, seller text, name text, primary key(chat_id, site, seller));
 create table if not exists sent(chat_id int, item text, ts real, task_id int, primary key(chat_id, item));
-create table if not exists proxies(site text, geo text, url text, primary key(site, geo));
+create table if not exists proxies(chat_id int, site text, geo text, url text, primary key(chat_id, site, geo));
 create table if not exists marks(site text, max_id int, ts real);
 create index if not exists marks_idx on marks(site, max_id);
 """)
@@ -90,6 +93,12 @@ if "name" not in {row[1] for row in db.execute("pragma table_info(hidden)")}:
     db.execute("alter table hidden add column name text")
 if "task_id" not in {row[1] for row in db.execute("pragma table_info(sent)")}:
     db.execute("alter table sent add column task_id int")
+if "chat_id" not in {row[1] for row in db.execute("pragma table_info(proxies)")}:
+    # прокси стали личными (chat_id; 0 — общий): добавленные раньше достаются админу, админа нет — общими
+    db.execute("alter table proxies rename to proxies_old")
+    db.execute("create table proxies(chat_id int, site text, geo text, url text, primary key(chat_id, site, geo))")
+    db.execute("insert into proxies select ?, site, geo, url from proxies_old", (ADMIN or 0,))
+    db.execute("drop table proxies_old")
 db.commit()
 
 last_error: dict[int, str] = {}  # текущая проблема задачи: полный отказ или часть стран
@@ -193,6 +202,7 @@ _locks: dict[str, asyncio.Lock] = {}
 
 
 async def get_json(key, impersonate, url, params=None, headers=None, warmup=None, proxy=None):
+    key = f"{key}|{proxy}"  # у пользователей свои прокси — сессии (куки, IP) не смешиваем
     async with _locks.setdefault(key, asyncio.Lock()):
         s = _sessions.get(key)
         try:
@@ -243,8 +253,7 @@ async def depop_user_profile(user_id: str):
         "safari",
         f"https://api.depop.com/api/v1/users/{user_id}/",
         headers={"Accept": "application/json"},
-        # профили не привязаны к стране: нет прокси «все страны» — берём любой прокси Depop
-        proxy=proxy_for("depop") or next((r[0] for r in db.execute("select url from proxies where site='depop'")), None),
+        proxy=proxy_for("depop"),  # профили не привязаны к стране: любой прокси Depop пользователя
     )
 
 
@@ -318,7 +327,7 @@ def vinted_markets(t):
     # Каталог Vinted подбирается по IP покупателя: с немецкого IP испанских продавцов в выдаче нет.
     # Если для Vinted ES назначен свой прокси — Испанию ищем отдельным каталогом vinted.es через испанский IP.
     c = vinted_countries(t)
-    es_own = "es" in c and bool(own_proxy("vinted", "es"))
+    es_own = "es" in c and bool(own_proxy("vinted", "es", t["chat_id"]))
     markets = []
     if c & set(VINTED_EU) - ({"es"} if es_own else set()):
         markets.append("vinted.de")
@@ -758,18 +767,31 @@ PROXY_GEOS = {**COUNTRIES, "vinted": ["eu", "es", "us"]}
 VINTED_GEO = {"vinted.de": "eu", "vinted.es": "es", "vinted.com": "us"}
 
 
-def own_proxy(site, geo):
-    row = db.execute("select url from proxies where site=? and geo=?", (site, geo)).fetchone()
+current_chat: ContextVar[int] = ContextVar("current_chat", default=0)  # чья задача сейчас ходит в сеть; 0 — ничья
+
+
+def own_proxy(site, geo, chat):
+    """Прокси ровно этой страны: свой, иначе общий (chat_id=0)."""
+    row = db.execute("select url from proxies where site=? and geo=? and chat_id in (?, 0) order by chat_id=0 limit 1",
+                     (site, geo, chat)).fetchone()
     return row[0] if row else None
 
 
-def proxy_for(site, geo=None):
-    """Свой прокси площадки: для страны, иначе «все страны». None — общий PROXIES из .env (или без прокси)."""
-    return (geo and own_proxy(site, geo)) or own_proxy(site, "*")
+def proxy_for(site, geo=None, chat=None):
+    """Свой прокси (страны → «все страны»), иначе общий (так же). geo=None — любой прокси площадки, «все страны»
+    первым. chat по умолчанию — владелец текущей задачи. None — общий PROXIES из .env (или без прокси)."""
+    chat = current_chat.get() if chat is None else chat
+    if geo:
+        where, args = "geo in (?, '*') order by chat_id=0, geo='*'", (geo,)
+    else:
+        where, args = "1 order by chat_id=0, geo!='*'", ()
+    row = db.execute(f"select url from proxies where site=? and chat_id in (?, 0) and {where} limit 1",
+                     (site, chat, *args)).fetchone()
+    return row[0] if row else None
 
 
-def has_proxy(site, geo):
-    return bool(proxy_for(site, geo) or PROXY_LIST)
+def has_proxy(site, geo, chat):
+    return bool(proxy_for(site, geo, chat) or PROXY_LIST)
 
 
 def mask_proxy(url):
@@ -788,17 +810,17 @@ async def reset_sessions():
                     pass
 
 
-def proxy_notes(site, countries):
+def proxy_notes(site, countries, chat):
     """Предупреждения при запуске задачи: площадка с этого IP не работает без прокси."""
     notes = []
-    if site == "depop" and not all(has_proxy("depop", c) for c in countries):
+    if site == "depop" and not all(has_proxy("depop", c, chat) for c in countries):
         notes.append("🔒 <b>Depop без прокси не работает:</b> отвечает 403 на обычные домашние и серверные IP. "
                      "Нужен резидентский прокси — добавь через /proxy.")
-    if site == "vinted" and "us" in countries and not has_proxy("vinted", "us"):
+    if site == "vinted" and "us" in countries and not has_proxy("vinted", "us", chat):
         notes.append("🔒 <b>Vinted США</b> (vinted.com) пускает только американские IP — добавь прокси США: "
                      "/proxy → VINTED → US.")
     if site == "vinted" and "es" in countries and len(countries) < len(COUNTRIES["vinted"]) \
-            and not own_proxy("vinted", "es"):
+            and not own_proxy("vinted", "es", chat):
         notes.append("ℹ️ Испания ищется в общем каталоге ЕС — испанских продавцов там мало. Для полного каталога "
                      "vinted.es нужен прокси с IP Испании: /proxy → VINTED → ES.")
     return notes
@@ -1123,14 +1145,16 @@ async def check(bot, t):
 
 async def calibrate():
     tasks = db.execute("select * from tasks where active=1").fetchall()
-    markets = set()
-    for t in tasks:
+    markets = {}  # рынок → чей прокси взять для калибровки; задачи админа первыми — чтобы не тратить трафик друзей
+    for t in sorted(tasks, key=lambda t: t["chat_id"] != ADMIN):
         if t["site"] == "vinted":
-            markets.update(vinted_markets(t))
+            for market in vinted_markets(t):
+                markets.setdefault(market, t["chat_id"])
         elif t["site"] == "depop":
-            markets.add("depop")
+            markets.setdefault("depop", t["chat_id"])
 
-    for market in markets:
+    for market, chat in markets.items():
+        token = current_chat.set(chat)
         try:
             if market == "depop":
                 d = await depop_mobile_search({
@@ -1144,9 +1168,12 @@ async def calibrate():
             record_mark(market, top, time.time())
         except Exception as ex:
             log.info("calibrate %s: %s", market, ex)
+        finally:
+            current_chat.reset(token)
 
 
 async def run(bot, t):
+    current_chat.set(t["chat_id"])  # все запросы задачи идут через прокси её владельца (у gather у каждой run свой контекст)
     try:
         await check(bot, t)
     except Exception as ex:
@@ -1411,66 +1438,83 @@ def geo_label(site, geo):
     return f"{flag(geo)} {geo.upper()}"
 
 
-def render_proxies():
-    rows = db.execute("select site, geo, url from proxies order by site, geo").fetchall()
-    lines = ["🌐 <b>Свои прокси по площадкам</b>",
-             "Порядок выбора: прокси страны → прокси площадки «все страны» → общий PROXIES из .env → без прокси.", ""]
-    lines += [f"• {r['site'].upper()} {geo_label(r['site'], r['geo'])} — <code>{html.escape(mask_proxy(r['url']))}</code>"
-              for r in rows] or ["Своих прокси пока нет."]
-    lines.append(f"\nОбщий PROXIES из .env: {len(PROXY_LIST)} шт.")
-    dels = [[(f"🗑 {r['site'].upper()} {geo_label(r['site'], r['geo'])}"[:60], f"pxdel:{r['site']}:{r['geo']}")]
-            for r in rows]
-    return "\n".join(lines), kb([[("➕ Добавить / заменить", "pxadd")]] + dels)
+def render_proxies(chat_id, admin):
+    """Свои прокси пользователя и общие (chat_id=0): общими управляет только админ, остальным виден лишь список."""
+    label = lambda r: f"{r['site'].upper()} {geo_label(r['site'], r['geo'])}"
+    own = db.execute("select site, geo, url from proxies where chat_id=? order by site, geo", (chat_id,)).fetchall()
+    shared = db.execute("select site, geo, url from proxies where chat_id=0 order by site, geo").fetchall()
+    lines = ["🌐 <b>Твои прокси</b> — только для твоих задач, другим не видны",
+             "Порядок выбора: твой прокси страны → твой «все страны» → общий так же → PROXIES из .env → без прокси.", ""]
+    lines += [f"• {label(r)} — <code>{html.escape(mask_proxy(r['url']))}</code>" for r in own] or ["Своих прокси пока нет."]
+    lines.append("\n🤝 <b>Общие</b> — для тех, у кого нет своего:")
+    lines += [f"• {label(r)}" + (f" — <code>{html.escape(mask_proxy(r['url']))}</code>" if admin else "")
+              for r in shared] or ["нет"]
+    lines.append(f"Общий PROXIES из .env: {len(PROXY_LIST)} шт.")
+    rows = [[("➕ Добавить / заменить свой", "pxadd")]] + ([[("➕ Общий прокси", "pxadd:s")]] if admin else [])
+    rows += [[(f"🗑 {label(r)}"[:60], f"pxdel:{r['site']}:{r['geo']}")] for r in own]
+    if admin:
+        rows += [[(f"🗑 общий {label(r)}"[:60], f"pxdel:{r['site']}:{r['geo']}:s")] for r in shared]
+    return "\n".join(lines), kb(rows)
+
+
+def proxy_scope(c: CallbackQuery):
+    """Хвост ':s' в кнопке — общий прокси. Чужой (не админ) — None: такие кнопки игнорируем."""
+    shared = c.data.endswith(":s")
+    return None if shared and c.from_user.id != ADMIN else (":s" if shared else "")
 
 
 @dp.message(Command("proxy"))
 async def cmd_proxy(m: Message, state: FSMContext):
     await state.clear()
-    text, markup = render_proxies()
+    text, markup = render_proxies(m.chat.id, m.from_user.id == ADMIN)
     await m.answer(text, reply_markup=markup)
 
 
 @dp.callback_query(F.data == "pxlist")
 async def proxy_list(c: CallbackQuery, state: FSMContext):
     await state.clear()
-    text, markup = render_proxies()
+    text, markup = render_proxies(c.message.chat.id, c.from_user.id == ADMIN)
     await c.message.edit_text(text, reply_markup=markup)
     await c.answer()
 
 
-@dp.callback_query(F.data == "pxadd")
+@dp.callback_query(F.data.regexp(r"^pxadd(:s)?$"))
 async def proxy_pick_site(c: CallbackQuery, state: FSMContext):
+    if (s := proxy_scope(c)) is None:
+        return await c.answer()
     await state.clear()
-    sites = [(f"🛍 {s.upper()}", f"pxsite:{s}") for s in SITES]
-    await c.message.edit_text("Для какой площадки прокси?",
+    sites = [(f"🛍 {site.upper()}", f"pxsite:{site}{s}") for site in SITES]
+    await c.message.edit_text(f"Для какой площадки {'общий ' if s else ''}прокси?",
                               reply_markup=kb([sites[i:i + 3] for i in range(0, len(sites), 3)] + [[("⬅️ Назад", "pxlist")]]))
     await c.answer()
 
 
-@dp.callback_query(F.data.regexp(r"^pxsite:[a-z]+$"))
+@dp.callback_query(F.data.regexp(r"^pxsite:[a-z]+(:s)?$"))
 async def proxy_pick_geo(c: CallbackQuery, state: FSMContext):
-    site = c.data[7:]
-    if site not in SITES:
+    site = c.data.split(":")[1]
+    if site not in SITES or (s := proxy_scope(c)) is None:
         return await c.answer()
     await state.clear()
-    geos = [(geo_label(site, g), f"pxgeo:{site}:{g}") for g in PROXY_GEOS[site]]
+    geos = [(geo_label(site, g), f"pxgeo:{site}:{g}{s}") for g in PROXY_GEOS[site]]
     await c.message.edit_text(
         f"<b>{site.upper()}</b> — для какой страны? «Все страны» сработает там, где нет прокси конкретной страны.",
-        reply_markup=kb([[("🌍 Все страны площадки", f"pxgeo:{site}:*")]] + [geos[i:i + 3] for i in range(0, len(geos), 3)]
-                        + [[("⬅️ Назад", "pxadd")]]))
+        reply_markup=kb([[("🌍 Все страны площадки", f"pxgeo:{site}:*{s}")]] + [geos[i:i + 3] for i in range(0, len(geos), 3)]
+                        + [[("⬅️ Назад", f"pxadd{s}")]]))
     await c.answer()
 
 
-@dp.callback_query(F.data.regexp(r"^pxgeo:[a-z]+:([a-z]{2}|\*)$"))
+@dp.callback_query(F.data.regexp(r"^pxgeo:[a-z]+:([a-z]{2}|\*)(:s)?$"))
 async def proxy_ask_url(c: CallbackQuery, state: FSMContext):
-    _, site, geo = c.data.split(":")
+    _, site, geo, *_ = c.data.split(":")
+    if (s := proxy_scope(c)) is None:
+        return await c.answer()
     await state.set_state(ProxyForm.url)
-    await state.set_data({"site": site, "geo": geo})
+    await state.set_data({"site": site, "geo": geo, "owner": 0 if s else c.message.chat.id})
     await c.message.edit_text(
-        f"<b>{site.upper()}</b> {geo_label(site, geo)}\n\nПришли прокси одной строкой:\n"
+        f"{'🤝 Общий: ' if s else ''}<b>{site.upper()}</b> {geo_label(site, geo)}\n\nПришли прокси одной строкой:\n"
         "<code>http://user:pass@host:port</code> или <code>socks5://user:pass@host:port</code>\n\n"
         "Проверю его перед сохранением, а сообщение с паролем удалю из чата.",
-        reply_markup=kb([[("⬅️ Назад", f"pxsite:{site}")]]))
+        reply_markup=kb([[("⬅️ Назад", f"pxsite:{site}{s}")]]))
     await c.answer()
 
 
@@ -1515,28 +1559,31 @@ async def proxy_got_url(m: Message, state: FSMContext):
         return await m.answer(f"❌ Прокси не отвечает: <code>{html.escape(str(e)[:200])}</code>\n"
                               "Пришли другой или /proxy — отмена.")
     await state.clear()
-    db.execute("insert or replace into proxies values(?,?,?)", (d["site"], d["geo"], url))
+    db.execute("insert or replace into proxies(chat_id, site, geo, url) values(?,?,?,?)",
+               (d["owner"], d["site"], d["geo"], url))
     db.commit()
     await reset_sessions()
     cc = (info.get("country") or "").lower()
-    text = (f"✅ Сохранил: {d['site'].upper()} {geo_label(d['site'], d['geo'])} — "
+    text = (f"✅ Сохранил{' общий' if d['owner'] == 0 else ''}: {d['site'].upper()} {geo_label(d['site'], d['geo'])} — "
             f"<code>{html.escape(mask_proxy(url))}</code>\nIP прокси: <code>{html.escape(str(info.get('ip', '?')))}</code> "
             f"{flag(cc)} {cc.upper()}")
     if d["geo"] not in ("*", "eu") and cc and cc != d["geo"]:
         text += (f"\n⚠️ IP из {cc.upper()}, а выбрана страна {d['geo'].upper()} — площадка может показывать "
                  "каталог не той страны или не пускать.")
     await m.answer(text)
-    text, markup = render_proxies()
+    text, markup = render_proxies(m.chat.id, m.from_user.id == ADMIN)
     await m.answer(text, reply_markup=markup)
 
 
-@dp.callback_query(F.data.regexp(r"^pxdel:[a-z]+:([a-z]{2}|\*)$"))
+@dp.callback_query(F.data.regexp(r"^pxdel:[a-z]+:([a-z]{2}|\*)(:s)?$"))
 async def proxy_delete(c: CallbackQuery, state: FSMContext):
-    _, site, geo = c.data.split(":")
-    db.execute("delete from proxies where site=? and geo=?", (site, geo))
+    _, site, geo, *_ = c.data.split(":")
+    if (s := proxy_scope(c)) is None:
+        return await c.answer()
+    db.execute("delete from proxies where chat_id=? and site=? and geo=?", (0 if s else c.message.chat.id, site, geo))
     db.commit()
     await reset_sessions()
-    text, markup = render_proxies()
+    text, markup = render_proxies(c.message.chat.id, c.from_user.id == ADMIN)
     await c.message.edit_text(text, reply_markup=markup)
     await c.answer("Прокси удалён")
 
@@ -1842,7 +1889,7 @@ async def finish_task(msg_or_callback, state: FSMContext):
         if t["max_age"] and t["max_age"] < min_age:
             answer_msg += (f"\n⚠️ Свежесть «{AGES.get(t['max_age'])}» здесь будет отсекать часть объявлений — "
                            f"лучше {AGES.get(min_age)} или больше.")
-    for note in proxy_notes(t["site"], (t["country"] or ",".join(COUNTRIES[t["site"]])).split(",")):
+    for note in proxy_notes(t["site"], (t["country"] or ",".join(COUNTRIES[t["site"]])).split(","), t["chat_id"]):
         answer_msg += "\n\n" + note
 
     if isinstance(msg_or_callback, Message):
