@@ -134,6 +134,7 @@ def parse_each(raw, parse, where):
             bad.append(f"{type(e).__name__}: {e}")
             continue
         if item:  # None — объявление отсеяно правилами площадки (платное, поднятое…)
+            item["src"] = where  # страна/рынок выдачи: по нему check узнаёт рынок, ответивший впервые
             out.append(item)
     if bad and len(bad) == len(raw):
         raise RuntimeError(f"формат ответа изменился ({where}): {bad[0]}")
@@ -241,7 +242,8 @@ async def depop_user_profile(user_id: str):
         "safari",
         f"https://api.depop.com/api/v1/users/{user_id}/",
         headers={"Accept": "application/json"},
-        proxy=proxy_for("depop"),
+        # профили не привязаны к стране: нет прокси «все страны» — берём любой прокси Depop
+        proxy=proxy_for("depop") or next((r[0] for r in db.execute("select url from proxies where site='depop'")), None),
     )
 
 
@@ -403,7 +405,8 @@ def _to_dt(value):
             return None
     if isinstance(value, str):
         try:
-            return datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+            dt = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)  # без пояса — считаем UTC
         except Exception:
             return None
     return None
@@ -850,9 +853,7 @@ async def should_show_item(item, t, site):
         if seller_info is None:
             if not need_seller:
                 return True, item  # фильтров продавца нет — показываем и без данных о нём
-            if not seller_id:
-                raise RuntimeError(f"{site} не отдаёт продавца в поиске — фильтры продавца не работают")
-            return False, None  # профиль удалён — проверить фильтры нельзя
+            return False, None  # продавца нет в выдаче или профиль удалён — проверить фильтры нельзя
 
         if seller_info.get("country"):
             item["location"] = ", ".join(filter(None, [seller_info.get("city"), flag(seller_info["country"])]))
@@ -1033,6 +1034,9 @@ async def check(bot, t):
     search, minus = split_query(t["query"])
     items, partial = await SITES[t["site"]]({**dict(t), "query": search})
     items = list({str(i["id"]): i for i in items}.values())  # одно объявление может прийти дважды
+    if t["site"] in ("depop", "vinted", "poshmark", "wallapop") and items and not any(i.get("seller_id") for i in items) \
+            and (t["min_reviews"] or t["min_account_days"] or t["contacts_only"]):
+        raise RuntimeError(f"{t['site']} не отдаёт продавца в поиске — фильтры продавца не работают")
     if partial:
         last_error[t["id"]] = f"часть не парсится — {partial}"
     else:
@@ -1055,25 +1059,37 @@ async def check(bot, t):
         if not exists:
             fresh.append(i)
 
-    out, retry = [], []
+    # страна/рынок, впервые ответившие после прогрева (добавили прокси, сайт ожил после долгого простоя):
+    # их выдачу молча помечаем увиденной, иначе вся она придёт как новая
+    known = {r[0] for r in db.execute("select item_id from seen where task_id=? and item_id like 'src:%'", (t["id"],))}
+    fresh_ids = {str(i["id"]) for i in fresh}
+    new_src = {i["src"] for i in items if f"src:{i['src']}" not in known} \
+        - {i["src"] for i in items if str(i["id"]) not in fresh_ids}
+
+    out, retry, profile_err = [], [], None
     if t["primed"]:
         for n, i in enumerate(fresh):
-            if str(i.get("seller_id")) in hidden or \
+            if i["src"] in new_src or str(i.get("seller_id")) in hidden or \
                     any(w in f"{i.get('title', '')} {i.get('brand', '')} {i.get('description') or ''}".lower()
                         for w in minus):
                 continue
             try:
                 should_show, processed_item = await should_show_item(i, t, t["site"])
             except SellerRetry as e:
-                # Vinted ограничил запросы профилей: остаток выдачи не помечаем увиденным — дойдём в следующем цикле
-                retry = fresh[n:]
-                log.info("task #%s: %s, отложено объявлений: %s", t["id"], e, len(retry))
-                break
+                profile_err = str(e)
+                retry.append(i)  # не помечаем увиденным — этот профиль попробуем в следующем цикле
+                if "429" in profile_err or len(retry) >= 3:  # лимит запросов или профили не грузятся вообще
+                    retry += fresh[n + 1:]
+                    log.info("task #%s: %s, отложено объявлений: %s", t["id"], e, len(retry))
+                    break
+                continue  # один битый профиль не держит остальную выдачу
             if should_show and processed_item:
                 out.append(processed_item)
             if len(out) >= MAX_PER_CYCLE:
-                retry = fresh[n + 1:]  # не успели проверить — не теряем, дойдём в следующем цикле
+                retry += fresh[n + 1:]  # не успели проверить — не теряем, дойдём в следующем цикле
                 break
+    if profile_err and not out and "429" not in profile_err:  # без этого задача молча ничего не присылает
+        last_error.setdefault(t["id"], profile_err)
 
     current = db.execute("select * from tasks where id=?", (t["id"],)).fetchone()
     if not current or tuple(current) != tuple(t):
@@ -1084,6 +1100,7 @@ async def check(bot, t):
     pending = {str(i["id"]) for i in retry + out}
     db.executemany("insert or replace into seen values(?,?,?)",
                    [(t["id"], str(i["id"]), now) for i in items if str(i["id"]) not in pending])
+    db.executemany("insert or replace into seen values(?,?,?)", [(t["id"], f"src:{s}", now) for s in {i["src"] for i in items}])
     db.execute("update tasks set primed=1 where id=?", (t["id"],))
     db.commit()
 
@@ -1093,12 +1110,14 @@ async def check(bot, t):
                 return
             # то же объявление могла поймать другая задача этого чата — второй раз не шлём
             key = f"{t['site']}:{i['id']}"
-            if not db.execute("select 1 from sent where chat_id=? and item=?", (t["chat_id"], key)).fetchone():
+            new = not db.execute("select 1 from sent where chat_id=? and item=?", (t["chat_id"], key)).fetchone()
+            if new:
                 await send(bot, t, i)
                 db.execute("insert or replace into sent values(?,?,?,?)", (t["chat_id"], key, time.time(), t["id"]))
-                await asyncio.sleep(1)
             db.execute("insert or replace into seen values(?,?,?)", (t["id"], str(i["id"]), time.time()))
-            db.commit()
+            db.commit()  # до паузы: прибили процесс в эту секунду — после рестарта не будет дубля
+            if new:
+                await asyncio.sleep(1)
 
 
 async def calibrate():
@@ -1368,7 +1387,9 @@ def render_stats(chat_id):
                        (day_start, chat_id, time.time() - 7 * 86400)).fetchone()
     lines.append(f"\nВсего: <b>{total[0] or 0}</b> · {total[1]}")
     text = "\n".join(lines)
-    return text if len(text) < 4000 else text[:3990] + "\n…"
+    if len(text) >= 4000:  # режем целыми строками: разрезанный посреди <b> текст Telegram не примет
+        text = text[:3990].rsplit("\n", 1)[0] + "\n…"
+    return text
 
 
 @dp.message(Command("stats"))
@@ -1452,6 +1473,24 @@ async def proxy_ask_url(c: CallbackQuery, state: FSMContext):
     await c.answer()
 
 
+@dp.message(Command("stop"))
+@dp.message(F.text == BTN_STOP)
+async def stop_all(m: Message, state: FSMContext):
+    await state.clear()
+    n = db.execute("update tasks set active=0 where chat_id=? and active=1", (m.chat.id,)).rowcount
+    db.commit()
+    await m.answer(f"⏹️ Остановлено задач: {n}. Запустить снова — «{BTN_GO}» или /go.", reply_markup=MENU)
+
+
+@dp.message(Command("go"))
+@dp.message(F.text == BTN_GO)
+async def go_all(m: Message, state: FSMContext):
+    await state.clear()
+    n = db.execute("update tasks set active=1 where chat_id=? and active=0", (m.chat.id,)).rowcount
+    db.commit()
+    await m.answer(f"▶️ Запущено задач: {n}." if n else "Остановленных задач нет.", reply_markup=MENU)
+
+
 @dp.message(ProxyForm.url, F.text)
 async def proxy_got_url(m: Message, state: FSMContext):
     url = m.text.strip()
@@ -1499,24 +1538,6 @@ async def proxy_delete(c: CallbackQuery, state: FSMContext):
     text, markup = render_proxies()
     await c.message.edit_text(text, reply_markup=markup)
     await c.answer("Прокси удалён")
-
-
-@dp.message(Command("stop"))
-@dp.message(F.text == BTN_STOP)
-async def stop_all(m: Message, state: FSMContext):
-    await state.clear()
-    n = db.execute("update tasks set active=0 where chat_id=? and active=1", (m.chat.id,)).rowcount
-    db.commit()
-    await m.answer(f"⏹️ Остановлено задач: {n}. Запустить снова — «{BTN_GO}» или /go.", reply_markup=MENU)
-
-
-@dp.message(Command("go"))
-@dp.message(F.text == BTN_GO)
-async def go_all(m: Message, state: FSMContext):
-    await state.clear()
-    n = db.execute("update tasks set active=1 where chat_id=? and active=0", (m.chat.id,)).rowcount
-    db.commit()
-    await m.answer(f"▶️ Запущено задач: {n}." if n else "Остановленных задач нет.", reply_markup=MENU)
 
 
 @dp.callback_query(F.data.startswith("site:"))
@@ -1604,9 +1625,9 @@ SELLER_KEYS = ("min_reviews", "min_account_days", "contacts_only", "private_only
 BACK_ROW = [("⬅️ Назад", "back")]
 
 
-def keep_row(d, label):
+def keep_row(d, label, step):
     """При правке задачи — кнопка «оставить как было» с текущим значением."""
-    return [[(f"↩️ Оставить: {label}"[:60], "keep")]] if "old" in d else []
+    return [[(f"↩️ Оставить: {label}"[:60], f"keep:{step}")]] if "old" in d else []
 
 
 def query_prompt(d):
@@ -1614,7 +1635,7 @@ def query_prompt(d):
     return (f"<b>{site.upper()}</b> · {countries_text(site, ','.join(d['countries']))}\n\n"
             "✏️ Напиши, что искать (например: <code>nike dunk low</code>)\n"
             "Исключить слова — через минус: <code>nike dunk -kids -replica</code>"), \
-        kb(keep_row(d, (d.get("old") or {}).get("query")) + [BACK_ROW])
+        kb(keep_row(d, (d.get("old") or {}).get("query"), "query") + [BACK_ROW])
 
 
 def currencies(site, countries):
@@ -1630,7 +1651,7 @@ def price_prompt(d):
     note = (f"Валюта: <b>{cur[0]}</b>" if len(cur) == 1 else
             f"Валюты: <b>{', '.join(cur)}</b> — число применяется как есть в валюте каждой страны, без пересчёта")
     return (f"💰 Цена: напиши <code>10-50</code>, <code>до 50</code> или <code>от 10</code>\n<i>{note}</i>",
-            kb([[("Любая цена", "price:any")]] + keep_row(d, price_text(old.get("pmin"), old.get("pmax")) or "любая")
+            kb([[("Любая цена", "price:any")]] + keep_row(d, price_text(old.get("pmin"), old.get("pmax")) or "любая", "price")
                + [BACK_ROW]))
 
 
@@ -1639,7 +1660,7 @@ def age_prompt(d):
     old_age = (d.get("old") or {}).get("max_age") or 0
     return ("🕒 Насколько свежие объявления присылать?",
             kb([[(txt, f"age:{v}") for v, txt in ages[i:i + 3]] for i in (0, 3)]
-               + keep_row(d, AGES.get(old_age, f"{old_age} мин")) + [BACK_ROW]))
+               + keep_row(d, AGES.get(old_age, f"{old_age} мин"), "age") + [BACK_ROW]))
 
 
 def seller_prompt(d):
@@ -1655,7 +1676,7 @@ def seller_prompt(d):
             "• <code>0 0 0 1</code> — только частные продавцы, без профи и магазинов\n"
             "• <code>10 0 1 1</code> — от 10 отзывов, есть контакты, частный продавец"
             + (f"\n\n<i>{note}</i>" if note else ""),
-            kb([[("Пропустить (0 0 0 0)", "seller:skip")]] + keep_row(d, cur) + [BACK_ROW]))
+            kb([[("Пропустить (0 0 0 0)", "seller:skip")]] + keep_row(d, cur, "seller_filters") + [BACK_ROW]))
 
 
 # шаг мастера → предыдущий шаг и его вопрос
@@ -1708,7 +1729,7 @@ async def got_seller_filters(m: Message, state: FSMContext):
         return await m.answer("Нужно 3 или 4 числа через пробел: отзывы дни контакты(0/1) частные(0/1)")
     try:
         reviews, days, contacts, private = (int(p) for p in parts + ["0"] * (4 - len(parts)))
-        if contacts not in (0, 1) or private not in (0, 1) or reviews < 0 or days < 0:
+        if contacts not in (0, 1) or private not in (0, 1) or not 0 <= reviews <= 10**6 or not 0 <= days <= 10**5:
             raise ValueError
     except ValueError:
         return await m.answer("Неверный формат. Примеры: <code>5 30 1</code> или <code>0 0 0 1</code>")
@@ -1729,11 +1750,12 @@ KEEP = {
 }
 
 
-@dp.callback_query(F.data == "keep")
+@dp.callback_query(F.data.startswith("keep:"))
 async def keep_value(c: CallbackQuery, state: FSMContext):
     d = await state.get_data()
-    step = KEEP.get(await state.get_state())
-    if not step or "old" not in d:
+    st = await state.get_state()
+    step = KEEP.get(st)
+    if not step or "old" not in d or st != f"New:{c.data[5:]}":  # кнопка из старого сообщения — от другого шага
         return await c.answer()
     keys, nxt, prompt = step
     await state.update_data({k: d["old"][k] for k in keys})
@@ -1798,6 +1820,7 @@ async def finish_task(msg_or_callback, state: FSMContext):
             return
         last_error.pop(tid, None)
         alerted.pop(tid, None)
+        streak.pop(tid, None)
         text = "✅ Задача обновлена"
     else:
         tid = db.execute(
@@ -1834,8 +1857,12 @@ async def on_task_button(c: CallbackQuery):
     if action == "toggle":
         db.execute("update tasks set active=1-active where id=? and chat_id=?", (tid, chat_id))
     else:
-        db.execute("delete from tasks where id=? and chat_id=?", (tid, chat_id))
-        db.execute("delete from seen where task_id=?", (tid,))
+        if db.execute("delete from tasks where id=? and chat_id=?", (tid, chat_id)).rowcount:
+            db.execute("delete from seen where task_id=?", (tid,))
+            # id без AUTOINCREMENT достанется следующей задаче — чужие статистика и алерты ей не нужны
+            db.execute("update sent set task_id=null where task_id=?", (tid,))
+            for state_by_task in (last_error, alerted, streak):
+                state_by_task.pop(int(tid), None)
     db.commit()
     await show_list(c, int(page[0]) if page else 0)
 

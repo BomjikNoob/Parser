@@ -35,7 +35,7 @@ assert extract_contacts("Тел. 8 701 234 56 78, 8(777)1234567", ["kz"])["phone
 
 # разбор объявлений по одному: кривое пропускается, None — отсеяно правилами, всё кривое — формат сменился
 parse = lambda o: None if o.get("skip") else {"id": o["id"]}
-assert bot.parse_each([{"id": 1}, {"oops": 1}, {"skip": 1}, {"id": 2}], parse, "x") == [{"id": 1}, {"id": 2}]
+assert bot.parse_each([{"id": 1}, {"oops": 1}, {"skip": 1}, {"id": 2}], parse, "x") == [{"id": 1, "src": "x"}, {"id": 2, "src": "x"}]
 assert bot.parse_each([{"skip": 1}], parse, "x") == [] and bot.parse_each([], parse, "x") == []
 for bad_call in (lambda: bot.parse_each([{"oops": 1}, {}], parse, "x"), lambda: bot.items_of({"data": {}}, "data", "items"),
                  lambda: bot.items_of({"items": None}, "items")):
@@ -46,6 +46,7 @@ for bad_call in (lambda: bot.parse_each([{"oops": 1}, {}], parse, "x"), lambda: 
     else:
         raise AssertionError("ожидали RuntimeError")
 assert bot.items_of({"a": {"b": []}}, "a", "b") == []
+assert bot._to_dt("2024-01-01T00:00:00").tzinfo is not None  # без пояса — иначе вычитание из aware now падает
 
 # время публикации по меткам id: id 100 видели в t=0, id 200 — в t=600
 bot.db = sqlite3.connect(":memory:")
