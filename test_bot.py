@@ -32,6 +32,11 @@ assert extract_contacts("call (555) 123-4567 or 07700 900123", ["us", "gb"])["ph
 assert extract_contacts("0151 23456789", ["de"])["phones"] == ["+4915123456789"]
 assert extract_contacts("612 345 678", ["fr"])["phones"] == []
 assert extract_contacts("Тел. 8 701 234 56 78, 8(777)1234567", ["kz"])["phones"] == ["+77012345678", "+77771234567"]
+# перенос строки не склеивает номер с цифрами следующей строки
+assert extract_contacts("WhatsApp: +34 612 345 678\n\n100% original")["phones"] == ["+34612345678"]
+assert extract_contacts("+1 (555) 123-4567\n2 pairs")["phones"] == ["+15551234567"]
+assert extract_contacts("call 07700 900123\r\n5 items", ["gb"])["phones"] == ["+447700900123"]
+assert extract_contacts("tel\xa0+49\xa0151\xa023456789")["phones"] == ["+4915123456789"]
 
 # разбор объявлений по одному: кривое пропускается, None — отсеяно правилами, всё кривое — формат сменился
 parse = lambda o: None if o.get("skip") else {"id": o["id"]}
