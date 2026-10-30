@@ -84,6 +84,7 @@ for _col, _ddl in [
     ("min_account_days", "integer default 0"),
     ("contacts_only", "integer default 0"),
     ("private_only", "integer default 0"),
+    ("started_at", "real"),  # когда задачу запустили (создание, правка, снятие с паузы) — для «Время» в статусе
 ]:
     if _col not in _existing_cols:
         db.execute(f"alter table tasks add column {_col} {_ddl}")
@@ -95,6 +96,9 @@ if "name" not in {row[1] for row in db.execute("pragma table_info(hidden)")}:
     db.execute("alter table hidden add column name text")
 if "task_id" not in {row[1] for row in db.execute("pragma table_info(sent)")}:
     db.execute("alter table sent add column task_id int")
+if "summary" not in {row[1] for row in db.execute("pragma table_info(sent)")}:
+    db.execute("alter table sent add column summary text")  # «название - цена · место» для статуса задачи
+db.execute("update tasks set started_at=? where started_at is null", (time.time(),))
 if "chat_id" not in {row[1] for row in db.execute("pragma table_info(proxies)")}:
     # прокси стали личными (chat_id; 0 — общий): добавленные раньше достаются админу, админа нет — общими
     db.execute("alter table proxies rename to proxies_old")
@@ -106,6 +110,7 @@ db.commit()
 last_error: dict[int, str] = {}  # текущая проблема задачи: полный отказ или часть стран
 alerted: dict[int, str] = {}  # о каком состоянии ("fail"/"partial") уже написали в чат
 streak: dict[int, tuple] = {}  # (состояние, сколько проверок подряд оно держится)
+last_check: dict[int, float] = {}  # когда задача последний раз проверялась — для статуса
 ALERT_AFTER = 2  # о поломке пишем, только если она держится 2 проверки подряд: разовый таймаут — не повод
 
 
@@ -1147,7 +1152,8 @@ async def check(bot, t):
             new = not db.execute("select 1 from sent where chat_id=? and item=?", (t["chat_id"], key)).fetchone()
             if new:
                 await send(bot, t, i)
-                db.execute("insert or replace into sent values(?,?,?,?)", (t["chat_id"], key, time.time(), t["id"]))
+                db.execute("insert or replace into sent(chat_id, item, ts, task_id, summary) values(?,?,?,?,?)",
+                           (t["chat_id"], key, time.time(), t["id"], item_summary(i)))
             db.execute("insert or replace into seen values(?,?,?)", (t["id"], str(i["id"]), time.time()))
             db.commit()  # до паузы: прибили процесс в эту секунду — после рестарта не будет дубля
             if new:
@@ -1196,6 +1202,8 @@ async def run(bot, t):
             return
         last_error[t["id"]] = str(ex)[:300]
         log.warning("task #%s %s %r: %s", t["id"], t["site"], t["query"], ex)
+
+    last_check[t["id"]] = time.time()
 
     # пишем в чат только при смене состояния (сломалась / часть стран / починилась), а не каждый цикл
     err = last_error.get(t["id"])
@@ -1308,13 +1316,48 @@ def task_row(t):
             f"\n   {countries_text(t['site'], t['country'])}{err}")
 
 
+def fmt_duration(sec):
+    sec = int(sec)
+    h, m, s = sec // 3600, sec % 3600 // 60, sec % 60
+    return (f"{h} ч. " if h else "") + f"{m} мин. {s} сек."
+
+
+def item_summary(i):
+    title = i["title"] if len(i["title"]) <= 35 else i["title"][:34] + "…"
+    price = f"{i['currency']} {i['price']:g}" if i["price"] is not None else "цена не указана"
+    return " · ".join(filter(None, [f"{title} - {price}", i.get("location")]))
+
+
+def render_status(t):
+    """Карточка задачи: состояние, сколько прислано, время работы, последние объявления; «Обновить» перерисовывает."""
+    now = time.time()
+    found = db.execute("select count(*) from sent where task_id=? and ts>=?", (t["id"], t["started_at"] or 0)).fetchone()[0]
+    last = db.execute("select summary from sent where task_id=? and summary is not null order by ts desc limit 3",
+                      (t["id"],)).fetchall()
+    lines = [f"📡 <b>Парсинг #{t['id']} в процессе</b>" if t["active"] else f"⏸️ <b>Парсинг #{t['id']} на паузе</b>",
+             "", task_row(t), "", f"Найдено объявлений: <b>{found}</b>"]
+    if t["active"]:
+        lines.append(f"Время: {fmt_duration(now - (t['started_at'] or now))}")
+        checked = last_check.get(t["id"])
+        lines.append(f"Последняя проверка: {fmt_duration(now - checked)} назад" if checked
+                     else f"Первая проверка — в течение {INTERVAL} сек.")
+    if last:
+        lines += ["", f"<b>Последние {len(last)} объявления:</b>",
+                  "<blockquote>" + "\n".join(html.escape(r[0]) for r in last) + "</blockquote>"]
+    return "\n".join(lines), kb([
+        [("⏸️ Пауза" if t["active"] else "▶️ Запустить", f"sttog:{t['id']}"), ("🔄 Обновить", f"st:{t['id']}")],
+        [("✏️ Фильтры", f"edit:{t['id']}"), ("📋 Все задачи", "list:0")],
+    ])
+
+
 TASKS_PAGE = 10  # задач на страницу списка: лимиты Telegram — 4096 символов и 100 кнопок на сообщение
 
 
 def task_kb(rows, page, pages):
     nav = ([("◀️", f"list:{page - 1}")] if page > 0 else []) + [("🔄 Обновить", f"list:{page}")] + \
           ([("▶️", f"list:{page + 1}")] if page < pages - 1 else [])
-    return kb([[(f"{'⏸️' if t['active'] else '▶️'} #{t['id']}", f"toggle:{t['id']}:{page}"),
+    return kb([[(f"📊 #{t['id']}", f"st:{t['id']}"),
+                (f"{'⏸️' if t['active'] else '▶️'} #{t['id']}", f"toggle:{t['id']}:{page}"),
                 (f"✏️ #{t['id']}", f"edit:{t['id']}"),
                 (f"🗑 #{t['id']}", f"del:{t['id']}:{page}")] for t in rows] + [nav])
 
@@ -1574,7 +1617,7 @@ async def stop_all(m: Message, state: FSMContext):
 @dp.message(F.text == BTN_GO)
 async def go_all(m: Message, state: FSMContext):
     await state.clear()
-    n = db.execute("update tasks set active=1 where chat_id=? and active=0", (m.chat.id,)).rowcount
+    n = db.execute("update tasks set active=1, started_at=? where chat_id=? and active=0", (time.time(), m.chat.id)).rowcount
     db.commit()
     await m.answer(f"▶️ Запущено задач: {n}." if n else "Остановленных задач нет.", reply_markup=MENU)
 
@@ -1900,7 +1943,8 @@ async def finish_task(msg_or_callback, state: FSMContext):
     ).fetchone()
     if dup:  # такая задача уже есть — запускаем её, чтобы не идти за ней в «Мои задачи»
         was_active = db.execute("select active from tasks where id=?", (dup["id"],)).fetchone()[0]
-        db.execute("update tasks set active=1 where id=?", (dup["id"],))
+        db.execute("update tasks set active=1, started_at=case when active=0 then ? else started_at end where id=?",
+                   (time.time(), dup["id"]))
         db.commit()
         t = db.execute("select * from tasks where id=?", (dup["id"],)).fetchone()
         head = "уже работает" if was_active else "была на паузе — запустил её"
@@ -1913,8 +1957,8 @@ async def finish_task(msg_or_callback, state: FSMContext):
     if tid := d.get("edit"):
         if not db.execute(
             "update tasks set country=?, query=?, pmin=?, pmax=?, max_age=?, min_reviews=?, "
-            "min_account_days=?, contacts_only=?, private_only=?, primed=0 where id=? and chat_id=?",
-            (*vals, tid, chat_id),
+            "min_account_days=?, contacts_only=?, private_only=?, primed=0, started_at=? where id=? and chat_id=?",
+            (*vals, time.time(), tid, chat_id),
         ).rowcount:
             if isinstance(msg_or_callback, Message):
                 await msg_or_callback.answer("Задача уже удалена.")
@@ -1928,14 +1972,15 @@ async def finish_task(msg_or_callback, state: FSMContext):
     else:
         tid = db.execute(
             "insert into tasks(chat_id, site, country, query, pmin, pmax, max_age, min_reviews, "
-            "min_account_days, contacts_only, private_only) values(?,?,?,?,?,?,?,?,?,?,?)",
-            (chat_id, d["site"], *vals),
+            "min_account_days, contacts_only, private_only, started_at) values(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (chat_id, d["site"], *vals, time.time()),
         ).lastrowid
         text = "✅ Задача запущена"
 
     db.commit()
     t = db.execute("select * from tasks where id=?", (tid,)).fetchone()
-    answer_msg = f"{text}\n\n{task_row(t)}\n\nШлю только объявления, появившиеся после этого момента."
+    status, markup = render_status(t)
+    answer_msg = f"{text}\n\n{status}\n\nШлю только объявления, появившиеся после этого момента."
     if t["site"] in SLOW_FEED:
         lag, min_age = SLOW_FEED[t["site"]]
         answer_msg += (f"\n\n⏳ <b>{t['site'].upper()} отдаёт новые объявления с задержкой:</b> поиск площадки обновляется "
@@ -1955,9 +2000,9 @@ async def finish_task(msg_or_callback, state: FSMContext):
                            "очень мало. Лучше задать слово.")
 
     if isinstance(msg_or_callback, Message):
-        await msg_or_callback.answer(answer_msg)
+        await msg_or_callback.answer(answer_msg, reply_markup=markup)
     else:
-        await msg_or_callback.message.edit_text(answer_msg)
+        await msg_or_callback.message.edit_text(answer_msg, reply_markup=markup)
 
 
 @dp.callback_query(F.data.regexp(r"^(toggle|del):\d+(:\d+)?$"))  # без страницы — кнопки старых сообщений
@@ -1965,7 +2010,8 @@ async def on_task_button(c: CallbackQuery):
     action, tid, *page = c.data.split(":")
     chat_id = c.message.chat.id
     if action == "toggle":
-        db.execute("update tasks set active=1-active where id=? and chat_id=?", (tid, chat_id))
+        db.execute("update tasks set active=1-active, started_at=case when active=0 then ? else started_at end "
+                   "where id=? and chat_id=?", (time.time(), tid, chat_id))
     else:
         if db.execute("delete from tasks where id=? and chat_id=?", (tid, chat_id)).rowcount:
             db.execute("delete from seen where task_id=?", (tid,))
@@ -1975,6 +2021,26 @@ async def on_task_button(c: CallbackQuery):
                 state_by_task.pop(int(tid), None)
     db.commit()
     await show_list(c, int(page[0]) if page else 0)
+
+
+@dp.callback_query(F.data.regexp(r"^st(tog)?:\d+$"))
+async def on_status(c: CallbackQuery):
+    action, tid = c.data.split(":")
+    chat_id = c.message.chat.id
+    if action == "sttog":
+        db.execute("update tasks set active=1-active, started_at=case when active=0 then ? else started_at end "
+                   "where id=? and chat_id=?", (time.time(), tid, chat_id))
+        db.commit()
+    t = db.execute("select * from tasks where id=? and chat_id=?", (tid, chat_id)).fetchone()
+    if not t:
+        await c.message.edit_text("Задача удалена.")
+        return await c.answer()
+    text, markup = render_status(t)
+    try:
+        await c.message.edit_text(text, reply_markup=markup)
+    except TelegramBadRequest:  # ничего не поменялось
+        pass
+    await c.answer("Обновлено" if action == "st" else "Запущена" if t["active"] else "На паузе")
 
 
 @dp.callback_query(F.data.regexp(r"^(hide|unhide):[a-z]+:[\w-]+$"))
