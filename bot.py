@@ -261,8 +261,8 @@ async def depop(t):
     out, errors = [], []
     countries = (t["country"] or ",".join(COUNTRIES["depop"])).split(",")
     for c in countries:
-        params = {
-            "what": t["query"],
+        params = {  # пустой запрос — все объявления: «what» не шлём вовсе, как в calibrate
+            **({"what": t["query"]} if t["query"] else {}),
             "limit": 24,
             "country": c,
             "currency": DEPOP_CURRENCY.get(c, "EUR"),
@@ -632,7 +632,8 @@ def wallapop_item(i, countries):
 
 async def milanuncios(t):
     # Сайт закрыт защитой от ботов, но поисковый API отвечает. Профиля продавца в API нет — только имя и тип.
-    params = {"text": t["query"], "orderBy": "date", "limit": 60}
+    # пустой «text» API понимает как «ничего не нашлось» — для всех объявлений поле не шлём
+    params = {**({"text": t["query"]} if t["query"] else {}), "orderBy": "date", "limit": 60}
     if t["pmin"]:
         params["priceFrom"] = t["pmin"]
     if t["pmax"]:
@@ -952,7 +953,7 @@ def card(t, i):
 
     name = {"olx": "OLX"}.get(t["site"], t["site"].capitalize())
     lines.append(f"🔗 <a href=\"{e(i['url'])}\">Открыть на {name}</a>")
-    lines.append(f"🔎 #{t['id']}: {e(t['query'])}")
+    lines.append(f"🔎 #{t['id']}: {e(query_label(t['query']))}")
     return "\n".join(lines)
 
 
@@ -1048,6 +1049,10 @@ def split_query(q):
     words = q.split()
     return (" ".join(w for w in words if not w.startswith("-")),
             [w[1:].lower() for w in words if w.startswith("-") and len(w) > 1])
+
+
+def query_label(q):
+    return q or "все объявления"
 
 
 _chat_locks: dict[int, asyncio.Lock] = {}
@@ -1194,7 +1199,7 @@ async def run(bot, t):
     streak[t["id"]] = (state, n)
     if state == alerted.get(t["id"]) or (state is not None and n < ALERT_AFTER):
         return
-    head = f"Задача #{t['id']} {t['site'].upper()} «{html.escape(t['query'])}»"
+    head = f"Задача #{t['id']} {t['site'].upper()} «{html.escape(query_label(t['query']))}»"
     if state is None:
         text = f"✅ {head} снова работает"
         alerted.pop(t["id"], None)
@@ -1292,7 +1297,7 @@ def task_row(t):
     acc_age = f" 📅{t['min_account_days']}д+" if t["min_account_days"] else ""
     contacts = " 📧" if t["contacts_only"] else ""
     private = " 🙋частные" if t["private_only"] else ""
-    return (f"{'▶️' if t['active'] else '⏸️'} #{t['id']} {t['site'].upper()} «{e(t['query'])}»"
+    return (f"{'▶️' if t['active'] else '⏸️'} #{t['id']} {t['site'].upper()} «{e(query_label(t['query']))}»"
             f"{price}{age}{reviews}{acc_age}{contacts}{private}"
             f"\n   {countries_text(t['site'], t['country'])}{err}")
 
@@ -1407,7 +1412,7 @@ def render_stats(chat_id):
     lines = ["📊 <b>Прислано карточек</b> (сегодня · за 7 дней)", ""]
     for t in db.execute("select * from tasks where chat_id=? order by id", (chat_id,)):
         today, week = counts.pop(t["id"], (0, 0))
-        lines.append(f"{'▶️' if t['active'] else '⏸️'} #{t['id']} {t['site'].upper()} «{html.escape(t['query'])}»: "
+        lines.append(f"{'▶️' if t['active'] else '⏸️'} #{t['id']} {t['site'].upper()} «{html.escape(query_label(t['query']))}»: "
                      f"<b>{today}</b> · {week}")
     if counts:  # задачи уже удалены (и записи до появления статистики)
         lines.append(f"🗑 удалённые задачи: {sum(v[0] for v in counts.values())} · {sum(v[1] for v in counts.values())}")
@@ -1628,12 +1633,22 @@ async def got_query(m: Message, state: FSMContext):
     query = m.text.strip()
     if len(query) > 100:
         return await m.answer("Слишком длинный запрос, до 100 символов.")
-    if not split_query(query)[0]:
-        return await m.answer("Нужно хотя бы одно слово без минуса.")
+    if query.lower() in ("all", "все", "*"):
+        query = ""
     await state.update_data(query=query)
     await state.set_state(New.price)
     text, markup = price_prompt(await state.get_data())
     await m.answer(text, reply_markup=markup)
+
+
+@dp.callback_query(New.query, F.data == "query:all")
+async def query_all(c: CallbackQuery, state: FSMContext):
+    await state.update_data(query="")
+    await state.set_state(New.price)
+    await c.message.edit_reply_markup(reply_markup=None)
+    text, markup = price_prompt(await state.get_data())
+    await c.message.answer(text, reply_markup=markup)
+    await c.answer()
 
 
 @dp.message(New.price, F.text)
@@ -1682,8 +1697,10 @@ def query_prompt(d):
     site = d["site"]
     return (f"<b>{site.upper()}</b> · {countries_text(site, ','.join(d['countries']))}\n\n"
             "✏️ Напиши, что искать (например: <code>nike dunk low</code>)\n"
-            "Исключить слова — через минус: <code>nike dunk -kids -replica</code>"), \
-        kb(keep_row(d, (d.get("old") or {}).get("query"), "query") + [BACK_ROW])
+            "Исключить слова — через минус: <code>nike dunk -kids -replica</code>\n"
+            "Все новые объявления подряд — кнопка ниже или <code>all</code> (можно с минусами: <code>-kids</code>)"), \
+        kb([[("📋 Все объявления", "query:all")]]
+           + keep_row(d, query_label((d.get("old") or {}).get("query")), "query") + [BACK_ROW])
 
 
 def currencies(site, countries):
@@ -1891,6 +1908,13 @@ async def finish_task(msg_or_callback, state: FSMContext):
                            f"лучше {AGES.get(min_age)} или больше.")
     for note in proxy_notes(t["site"], (t["country"] or ",".join(COUNTRIES[t["site"]])).split(","), t["chat_id"]):
         answer_msg += "\n\n" + note
+    if not split_query(t["query"])[0]:
+        answer_msg += (f"\n\n📋 <b>Все объявления:</b> на крупных площадках это десятки в минуту, а за проверку я шлю не "
+                       f"больше {MAX_PER_CYCLE} — сузь ценой или фильтрами. Фильтры продавца грузят профиль каждого "
+                       f"объявления: больше трафика прокси и лимитов площадки.")
+        if t["site"] == "milanuncios":
+            answer_msg += ("\n⚠️ Milanuncios без запроса отдаёт почти одни «поднятые» старые объявления — новых будет "
+                           "очень мало. Лучше задать слово.")
 
     if isinstance(msg_or_callback, Message):
         await msg_or_callback.answer(answer_msg)
