@@ -1,0 +1,4 @@
+.env
+parser.db
+parser.log
+__pycache__/

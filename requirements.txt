@@ -1,0 +1,3 @@
+aiogram>=3.31
+curl_cffi>=0.17
+tzdata
