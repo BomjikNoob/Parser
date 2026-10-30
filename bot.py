@@ -41,7 +41,8 @@ INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
 PROXY_LIST = [p.strip() for p in os.getenv("PROXIES", "").split(",") if p.strip()]  # общий прокси для всех площадок
 PROXIES = itertools.cycle(PROXY_LIST or [None])
 TZ = ZoneInfo(os.environ["TIMEZONE"]) if os.getenv("TIMEZONE") else None  # None — часовой пояс компьютера
-MAX_PER_CYCLE = 10
+MAX_PER_CYCLE = 10  # карточек за проверку на задачу по умолчанию; свой лимит чата — /limit
+LIMITS = (5, 10, 20, 30, 50)
 SEEN_TTL = 2 * 86400  # объявление пропало из выдачи на 2 суток — забываем его
 CAPTION_MAX = 1024  # лимит Telegram на подпись к фото
 
@@ -72,6 +73,7 @@ create table if not exists hidden(chat_id int, site text, seller text, name text
 create table if not exists sent(chat_id int, item text, ts real, task_id int, primary key(chat_id, item));
 create table if not exists proxies(chat_id int, site text, geo text, url text, primary key(chat_id, site, geo));
 create table if not exists marks(site text, max_id int, ts real);
+create table if not exists settings(chat_id int primary key, max_per_cycle int);
 create index if not exists marks_idx on marks(site, max_id);
 """)
 
@@ -1086,6 +1088,9 @@ async def check(bot, t):
         exists = db.execute("select 1 from seen where task_id=? and item_id=?", (t["id"], item_id)).fetchone()
         if not exists:
             fresh.append(i)
+    # свежие первыми: упёрлись в лимит карточек — пропускаем самые старые, а не копим очередь с отставанием
+    fresh.sort(key=lambda i: i["ts"], reverse=True)
+    limit = chat_limit(t["chat_id"])
 
     # страна/рынок, впервые ответившие после прогрева (добавили прокси, сайт ожил после долгого простоя):
     # их выдачу молча помечаем увиденной, иначе вся она придёт как новая
@@ -1113,8 +1118,9 @@ async def check(bot, t):
                 continue  # один битый профиль не держит остальную выдачу
             if should_show and processed_item:
                 out.append(processed_item)
-            if len(out) >= MAX_PER_CYCLE:
-                retry += fresh[n + 1:]  # не успели проверить — не теряем, дойдём в следующем цикле
+            if len(out) >= limit:
+                if len(fresh) > n + 1:
+                    log.info("task #%s: лимит %s карточек — старых пропущено: %s", t["id"], limit, len(fresh) - n - 1)
                 break
     if profile_err and not out and "429" not in profile_err:  # без этого задача молча ничего не присылает
         last_error.setdefault(t["id"], profile_err)
@@ -1345,7 +1351,7 @@ async def cmd_start(m: Message, state: FSMContext):
         f"• Мин. возраст аккаунта (дней)\n"
         f"• Только объявления с email/телефоном\n"
         f"• Только частные продавцы (без профи и магазинов)\n\n"
-        f"Скрытые продавцы — /hidden · свои прокси — /proxy · статистика — /stats\n"
+        f"Скрытые продавцы — /hidden · свои прокси — /proxy · статистика — /stats · лимит карточек — /limit\n"
         f"Твой id: <code>{m.from_user.id}</code>",
         reply_markup=MENU,
     )
@@ -1429,6 +1435,38 @@ def render_stats(chat_id):
 async def cmd_stats(m: Message, state: FSMContext):
     await state.clear()
     await m.answer(render_stats(m.chat.id))
+
+
+def chat_limit(chat_id):
+    row = db.execute("select max_per_cycle from settings where chat_id=?", (chat_id,)).fetchone()
+    return row[0] if row else MAX_PER_CYCLE
+
+
+def render_limit(chat_id):
+    cur = chat_limit(chat_id)
+    return (f"📦 <b>Лимит карточек</b>: сейчас <b>{cur}</b> за проверку (~{INTERVAL} с) на каждую задачу.\n"
+            "Новых больше лимита — присылаю самые свежие, старые пропускаю: без очереди и отставания.\n"
+            "Большой лимит — больше трафика прокси на профили продавцов и риск флуд-лимита Telegram."), \
+        kb([[(f"✅ {n}" if n == cur else str(n), f"limit:{n}") for n in LIMITS]])
+
+
+@dp.message(Command("limit"))
+async def cmd_limit(m: Message, state: FSMContext):
+    await state.clear()
+    text, markup = render_limit(m.chat.id)
+    await m.answer(text, reply_markup=markup)
+
+
+@dp.callback_query(F.data.regexp(r"^limit:\d+$"))
+async def set_limit(c: CallbackQuery):
+    n = int(c.data[6:])
+    if n not in LIMITS:
+        return await c.answer()
+    db.execute("insert or replace into settings values(?, ?)", (c.message.chat.id, n))
+    db.commit()
+    text, markup = render_limit(c.message.chat.id)
+    await c.message.edit_text(text, reply_markup=markup)
+    await c.answer(f"Лимит: {n}")
 
 
 class ProxyForm(StatesGroup):
@@ -1909,9 +1947,9 @@ async def finish_task(msg_or_callback, state: FSMContext):
     for note in proxy_notes(t["site"], (t["country"] or ",".join(COUNTRIES[t["site"]])).split(","), t["chat_id"]):
         answer_msg += "\n\n" + note
     if not split_query(t["query"])[0]:
-        answer_msg += (f"\n\n📋 <b>Все объявления:</b> на крупных площадках это десятки в минуту, а за проверку я шлю не "
-                       f"больше {MAX_PER_CYCLE} — сузь ценой или фильтрами. Фильтры продавца грузят профиль каждого "
-                       f"объявления: больше трафика прокси и лимитов площадки.")
+        answer_msg += (f"\n\n📋 <b>Все объявления:</b> на крупных площадках это десятки в минуту, а за проверку я шлю "
+                       f"{chat_limit(t['chat_id'])} самых свежих (лимит — /limit), остальные пропускаю. Фильтры продавца "
+                       f"грузят профиль каждого объявления: больше трафика прокси и лимитов площадки.")
         if t["site"] == "milanuncios":
             answer_msg += ("\n⚠️ Milanuncios без запроса отдаёт почти одни «поднятые» старые объявления — новых будет "
                            "очень мало. Лучше задать слово.")
@@ -2018,6 +2056,7 @@ async def main():
         BotCommand(command="hidden", description="Скрытые продавцы"),
         BotCommand(command="proxy", description="Свои прокси по площадкам"),
         BotCommand(command="stats", description="Статистика карточек"),
+        BotCommand(command="limit", description="Лимит карточек за проверку"),
     ])
     poller = asyncio.create_task(poll(bot))
     try:
