@@ -53,6 +53,14 @@ for bad_call in (lambda: bot.parse_each([{"oops": 1}, {}], parse, "x"), lambda: 
 assert bot.items_of({"a": {"b": []}}, "a", "b") == []
 assert bot._to_dt("2024-01-01T00:00:00").tzinfo is not None  # без пояса — иначе вычитание из aware now падает
 
+# OfferUp: снятое (нет деталей) — никогда; поднятое старое — только в быстром парсе (fresh=False)
+utc = bot.datetime.timezone.utc
+now_dt = bot.datetime.datetime(2026, 1, 2, tzinfo=utc)
+o = {"listingId": "a", "title": "x", "price": "10", "sellerType": "DEALER", "locationName": "Brooklyn, NY"}
+det = lambda h: {"postDate": (now_dt - bot.datetime.timedelta(hours=h)).isoformat(), "owner": {"id": 1}}
+assert bot.offerup_item(o, det(1), now_dt)["seller_business"] and bot.offerup_item(o, None, now_dt, False) is None
+assert bot.offerup_item(o, det(48), now_dt) is None and bot.offerup_item(o, det(48), now_dt, False)["price"] == 10
+
 # время публикации по меткам id: id 100 видели в t=0, id 200 — в t=600
 bot.db = sqlite3.connect(":memory:")
 bot.db.execute("create table marks(site text, max_id int, ts real)")

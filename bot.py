@@ -1,4 +1,4 @@
-"""Мониторинг новых объявлений (Depop, Vinted, Poshmark, Wallapop, Milanuncios, OLX) с фильтрами по продавцу."""
+"""Мониторинг новых объявлений (Depop, Vinted, Poshmark, Wallapop, Milanuncios, OLX, OfferUp) с фильтрами по продавцу."""
 import asyncio
 import datetime
 import html
@@ -23,8 +23,8 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, Teleg
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import (BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton,
-                           LinkPreviewOptions, Message, ReplyKeyboardMarkup)
+from aiogram.types import (BotCommand, BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
+                           KeyboardButton, LinkPreviewOptions, Message, ReplyKeyboardMarkup)
 from curl_cffi.requests import AsyncSession
 
 ROOT = Path(__file__).parent
@@ -208,7 +208,7 @@ _sessions: dict[str, AsyncSession] = {}
 _locks: dict[str, asyncio.Lock] = {}
 
 
-async def get_json(key, impersonate, url, params=None, headers=None, warmup=None, proxy=None):
+async def get_json(key, impersonate, url, params=None, headers=None, warmup=None, proxy=None, body=None):
     key = f"{key}|{proxy}"  # у пользователей свои прокси — сессии (куки, IP) не смешиваем
     async with _locks.setdefault(key, asyncio.Lock()):
         s = _sessions.get(key)
@@ -219,7 +219,8 @@ async def get_json(key, impersonate, url, params=None, headers=None, warmup=None
                 )
                 if warmup:
                     await s.get(warmup)
-            r = await s.get(url, params=params, headers=headers)
+            r = await (s.post(url, params=params, headers=headers, json=body) if body is not None
+                       else s.get(url, params=params, headers=headers))
             if r.status_code != 200:
                 raise RuntimeError(f"HTTP {r.status_code}")
             try:
@@ -264,30 +265,23 @@ async def depop_user_profile(user_id: str):
     )
 
 
-async def depop(t):
-    out, errors = [], []
-    countries = (t["country"] or ",".join(COUNTRIES["depop"])).split(",")
-    for c in countries:
-        params = {  # пустой запрос — все объявления: «what» не шлём вовсе, как в calibrate
-            **({"what": t["query"]} if t["query"] else {}),
-            "limit": 24,
-            "country": c,
-            "currency": DEPOP_CURRENCY.get(c, "EUR"),
-            "ranking": "recent",
-            "from": "in_country_search",
-        }
-        if t["pmin"]:
-            params["price_min"] = t["pmin"]
-        if t["pmax"]:
-            params["price_max"] = t["pmax"]
-
-        try:
-            d = await depop_mobile_search(params)
-            out += parse_each(items_of(d, "objects"), depop_item, c)
-        except Exception as e:
-            log.warning(f"Depop search error {c}: {e}")
-            errors.append((c, str(e)))
-    return fetch_result(out, errors, len(countries))
+async def depop(t, c, cursor):
+    params = {  # пустой запрос — все объявления: «what» не шлём вовсе, как в calibrate
+        **({"what": t["query"]} if t["query"] else {}),
+        "limit": 24,
+        "country": c,
+        "currency": DEPOP_CURRENCY.get(c, "EUR"),
+        "ranking": "recent",
+        "from": "in_country_search",
+        **({"cursor": cursor} if cursor else {}),
+    }
+    if t["pmin"]:
+        params["price_min"] = t["pmin"]
+    if t["pmax"]:
+        params["price_max"] = t["pmax"]
+    d = await depop_mobile_search(params)
+    meta = d.get("meta") or {}
+    return parse_each(items_of(d, "objects"), depop_item, c), meta.get("cursor") if meta.get("has_more") else None
 
 
 def depop_item(o):
@@ -365,24 +359,17 @@ async def vinted_user_profile(market, user_id):
     return data.get("user", {})
 
 
-async def vinted(t):
+async def vinted(t, market, page):
     # 96 — максимум Vinted: по популярным запросам за минуту выходит ~60 новых, при 24 большая часть терялась
-    params = {"search_text": t["query"], "order": "newest_first", "per_page": 96}
+    params = {"search_text": t["query"], "order": "newest_first", "per_page": 96, **({"page": page} if page else {})}
     if t["pmin"]:
         params["price_from"] = t["pmin"]
     if t["pmax"]:
         params["price_to"] = t["pmax"]
-
-    out, errors = [], []
-    markets = vinted_markets(t)
-    for market in markets:
-        try:
-            d = await vinted_mobile_call(market, "/svc-catalogue/items", params)
-            out += parse_each(items_of(d, "items"), lambda i: vinted_item(i, market), market)
-        except Exception as e:
-            log.warning(f"Vinted search error {market}: {e}")
-            errors.append((market, str(e)))
-    return fetch_result(out, errors, len(markets))
+    d = await vinted_mobile_call(market, "/svc-catalogue/items", params)
+    page = page or 1
+    more = page < ((d.get("pagination") or {}).get("total_pages") or 0)  # Vinted отдаёт не больше 10 страниц
+    return parse_each(items_of(d, "items"), lambda i: vinted_item(i, market), market), page + 1 if more else None
 
 
 def vinted_item(i, market):
@@ -535,33 +522,26 @@ async def clear_seller_cache(key, delay):
 POSHMARK = {"us": "poshmark.com", "ca": "poshmark.ca"}
 
 
-async def poshmark(t):
-    out, errors = [], []
-    countries = (t["country"] or ",".join(POSHMARK)).split(",")
-    for c in countries:
-        host = POSHMARK[c]
-        req = {
-            "filters": {"department": "All", "inventory_status": ["available"]},
-            "query": t["query"],
-            "sort_by": "added_desc",
-            "count": 48,
-        }
-        try:
-            d = await get_json(
-                host,
-                "chrome",
-                f"https://{host}/vm-rest/posts",
-                {"request": json.dumps(req), "summarize": "true"},
-                {"Accept": "application/json"},
-                proxy=proxy_for("poshmark", c),
-            )
-            if "error" in d:  # vm-rest отвечает 200 и кладёт код ошибки внутрь
-                raise RuntimeError(f"HTTP {d['error'].get('statusCode')}")
-            out += parse_each(items_of(d, "data"), lambda o: poshmark_item(o, c, host), c)
-        except Exception as e:
-            log.warning(f"Poshmark error {c}: {e}")
-            errors.append((c, str(e)))
-    return fetch_result(out, errors, len(countries))
+async def poshmark(t, c, max_id):
+    host = POSHMARK[c]
+    req = {
+        "filters": {"department": "All", "inventory_status": ["available"]},
+        "query": t["query"],
+        "sort_by": "added_desc",
+        "count": 48,
+        **({"max_id": max_id} if max_id else {}),
+    }
+    d = await get_json(
+        host,
+        "chrome",
+        f"https://{host}/vm-rest/posts",
+        {"request": json.dumps(req), "summarize": "true"},
+        {"Accept": "application/json"},
+        proxy=proxy_for("poshmark", c),
+    )
+    if "error" in d:  # vm-rest отвечает 200 и кладёт код ошибки внутрь
+        raise RuntimeError(f"HTTP {d['error'].get('statusCode')}")
+    return parse_each(items_of(d, "data"), lambda o: poshmark_item(o, c, host), c), (d.get("more") or {}).get("next_max_id")
 
 
 def poshmark_item(o, c, host):
@@ -595,7 +575,7 @@ async def wallapop_get(path, params=None):
                           proxy=proxy_for("wallapop", "es"))
 
 
-async def wallapop(t):
+async def wallapop(t, _geo, next_page):
     # координаты — центр Испании: без них API берёт точку по гео-IP (с немецкого IP — Франкфурт)
     params = {"keywords": t["query"], "order_by": "newest", "source": "search_box",
               "latitude": 40.4168, "longitude": -3.7038}
@@ -603,15 +583,10 @@ async def wallapop(t):
         params["min_sale_price"] = t["pmin"]
     if t["pmax"]:
         params["max_sale_price"] = t["pmax"]
-    # Индекс поиска Wallapop обновляется пачками раз в ~5 мин: за это время по популярному запросу выходит
-    # больше 40 (одна страница), поэтому берём 2 страницы
-    d = await wallapop_get("/search", params)
-    items = items_of(d, "data", "section", "payload", "items")
-    if (d.get("meta") or {}).get("next_page"):
-        d = await wallapop_get("/search", {"next_page": d["meta"]["next_page"]})
-        items += items_of(d, "data", "section", "payload", "items")
+    d = await wallapop_get("/search", {"next_page": next_page} if next_page else params)  # токен хранит весь запрос
     countries = set((t["country"] or "es").split(","))
-    return parse_each(items, lambda i: wallapop_item(i, countries), "es"), ""
+    return (parse_each(items_of(d, "data", "section", "payload", "items"), lambda i: wallapop_item(i, countries), "es"),
+            (d.get("meta") or {}).get("next_page"))
 
 
 def wallapop_item(i, countries):
@@ -637,10 +612,11 @@ def wallapop_item(i, countries):
 # ---------- Milanuncios ----------
 
 
-async def milanuncios(t):
+async def milanuncios(t, _geo, offset):
     # Сайт закрыт защитой от ботов, но поисковый API отвечает. Профиля продавца в API нет — только имя и тип.
     # пустой «text» API понимает как «ничего не нашлось» — для всех объявлений поле не шлём
-    params = {**({"text": t["query"]} if t["query"] else {}), "orderBy": "date", "limit": 60}
+    params = {**({"text": t["query"]} if t["query"] else {}), "orderBy": "date", "limit": 60,
+              **({"offset": offset} if offset else {})}
     if t["pmin"]:
         params["priceFrom"] = t["pmin"]
     if t["pmax"]:
@@ -649,14 +625,18 @@ async def milanuncios(t):
                        {"Accept": "application/json", "Origin": "https://www.milanuncios.com",
                         "Referer": "https://www.milanuncios.com/"}, proxy=proxy_for("milanuncios", "es"))
     photos = {p["adId"]: p.get("imageUrls") or [] for p in d.get("photos", [])}
-    return parse_each(items_of(d, "ads"), lambda a: milanuncios_item(a, photos), "es"), ""
+    ads = items_of(d, "ads")
+    offset = (offset or 0) + len(ads)
+    total = ((d.get("pagination") or {}).get("totalHits") or {}).get("value") or 0
+    return (parse_each(ads, lambda a: milanuncios_item(a, photos, not t.get("bulk")), "es"),
+            offset if ads and offset < total else None)
 
 
-def milanuncios_item(a, photos):
-    # «куплю», платные «выделенные» и «поднятые» (sortDate ≠ publicationDate): поднятые старые объявления
-    # встают в выдачу как новые, хотя созданы дни и месяцы назад
-    if (a.get("transaction", "supply") != "supply" or a.get("isHighlighted")
-            or a.get("sortDate", a.get("publicationDate")) != a.get("publicationDate")):
+def milanuncios_item(a, photos, fresh=True):
+    # «куплю» не берём никогда; платные «выделенные» и «поднятые» (sortDate ≠ publicationDate) — только при fresh:
+    # поднятые старые объявления встают в выдачу как новые, хотя созданы дни и месяцы назад
+    if a.get("transaction", "supply") != "supply" or fresh and (
+            a.get("isHighlighted") or a.get("sortDate", a.get("publicationDate")) != a.get("publicationDate")):
         return None
     loc = a.get("location") or {}
     imgs = photos.get(a["id"])
@@ -692,33 +672,27 @@ OLX = {"pl": "www.olx.pl", "pt": "www.olx.pt", "ro": "www.olx.ro", "bg": "www.ol
 OLX_CURRENCY = {"pl": "PLN", "pt": "EUR", "ro": "RON", "bg": "EUR", "ua": "UAH", "kz": "KZT", "uz": "UZS"}
 
 
-async def olx(t):
-    out, errors = [], []
-    countries = (t["country"] or ",".join(OLX)).split(",")
+async def olx(t, c, offset):
+    host = OLX[c]
+    # sort_by=created_at:desc на деле сортирует по «обновлению»: наверху и новые, и поднятые старые
+    params = {"query": t["query"], "sort_by": "created_at:desc", "limit": 50, **({"offset": offset} if offset else {})}
+    if t["pmin"]:
+        params["filter_float_price:from"] = t["pmin"]
+    if t["pmax"]:
+        params["filter_float_price:to"] = t["pmax"]
+    d = await get_json(host, "chrome", f"https://{host}/api/v1/offers/", params, {"Accept": "application/json"},
+                       proxy=proxy_for("olx", c))
     now = datetime.datetime.now(datetime.timezone.utc)
-    for c in countries:
-        host = OLX[c]
-        # sort_by=created_at:desc на деле сортирует по «обновлению»: наверху и новые, и поднятые старые
-        params = {"query": t["query"], "sort_by": "created_at:desc", "limit": 50}
-        if t["pmin"]:
-            params["filter_float_price:from"] = t["pmin"]
-        if t["pmax"]:
-            params["filter_float_price:to"] = t["pmax"]
-        try:
-            d = await get_json(host, "chrome", f"https://{host}/api/v1/offers/", params, {"Accept": "application/json"},
-                               proxy=proxy_for("olx", c))
-            out += parse_each(items_of(d, "data"), lambda o: olx_item(o, c, host, now), c)
-        except Exception as e:
-            log.warning(f"OLX error {c}: {e}")
-            errors.append((c, str(e)))
-    return fetch_result(out, errors, len(countries))
+    nxt = (offset or 0) + 50 if (d.get("links") or {}).get("next") else None  # OLX листает до 1000 объявлений
+    return parse_each(items_of(d, "data"), lambda o: olx_item(o, c, host, now, not t.get("bulk")), c), nxt
 
 
-def olx_item(o, c, host, now):
+def olx_item(o, c, host, now, fresh=True):
     created, refreshed = _to_dt(o.get("created_time")), _to_dt(o.get("last_refresh_time"))
-    # платные «топ», «куплю», поднятые старые (обновлены позже чем через час после создания)
-    # и возобновлённые после истечения (созданы больше суток назад) — не новые
-    if ((o.get("promotion") or {}).get("top_ad") or o.get("offer_type", "offer") != "offer" or not created
+    # «куплю» не берём никогда; при fresh — ещё платные «топ», поднятые старые (обновлены позже чем через час
+    # после создания) и возобновлённые после истечения (созданы больше суток назад) — не новые
+    if o.get("offer_type", "offer") != "offer" or not created or fresh and (
+            (o.get("promotion") or {}).get("top_ad")
             or (refreshed and (refreshed - created).total_seconds() > 3600)
             or (now - created).total_seconds() > 86400):
         return None
@@ -755,10 +729,120 @@ def olx_item(o, c, host, now):
     )
 
 
+# ---------- OfferUp ----------
+
+# Поиск OfferUp локальный (радиус жёстко до 80 миль, общенациональной ленты нет), поэтому «страны» — сетка
+# агломераций США (коды аэропортов): код → (lat, lon). Все вместе покрывают населённую часть страны.
+# ponytail: 80 точек ≈ 30 с на круг через одну сессию (первый — ~60 с); глухие районы (WY, ND…) не покрыты — добавить точки
+OFFERUP = {"nyc": (40.7128, -74.0060), "lax": (34.0522, -118.2437), "chi": (41.8781, -87.6298),
+           "hou": (29.7604, -95.3698), "dfw": (32.7767, -96.7970), "phx": (33.4484, -112.0740),
+           "phl": (39.9526, -75.1652), "sat": (29.4241, -98.4936), "san": (32.7157, -117.1611),
+           "sfo": (37.7749, -122.4194), "sea": (47.6062, -122.3321), "mia": (25.7617, -80.1918),
+           "atl": (33.7490, -84.3880), "bos": (42.3601, -71.0589), "den": (39.7392, -104.9903),
+           "dtw": (42.3314, -83.0458), "las": (36.1699, -115.1398), "mco": (28.5383, -81.3792),
+           "was": (38.9072, -77.0369), "msp": (44.9778, -93.2650), "tpa": (27.9506, -82.4572),
+           "clt": (35.2271, -80.8431), "stl": (38.6270, -90.1994), "aus": (30.2672, -97.7431),
+           "pdx": (45.5152, -122.6784), "smf": (38.5816, -121.4944), "pit": (40.4406, -79.9959),
+           "cvg": (39.1031, -84.5120), "mci": (39.0997, -94.5786), "cmh": (39.9612, -82.9988),
+           "cle": (41.4993, -81.6944), "ind": (39.7684, -86.1581), "bna": (36.1627, -86.7816),
+           "orf": (36.8529, -75.9780), "jax": (30.3322, -81.6557), "rdu": (35.7796, -78.6382),
+           "mke": (43.0389, -87.9065), "okc": (35.4676, -97.5164), "sdf": (38.2527, -85.7585),
+           "mem": (35.1495, -90.0490), "ric": (37.5407, -77.4360), "slc": (40.7608, -111.8910),
+           "bhm": (33.5186, -86.8104), "fat": (36.7378, -119.7871), "buf": (42.8864, -78.8784),
+           "grr": (42.9634, -85.6681), "tus": (32.2226, -110.9747), "hnl": (21.3069, -157.8583),
+           "tul": (36.1540, -95.9928), "oma": (41.2565, -95.9345), "abq": (35.0844, -106.6504),
+           "msy": (29.9511, -90.0715), "bfl": (35.3733, -119.0187), "tys": (35.9606, -83.9207),
+           "elp": (31.7619, -106.4850), "alb": (42.6526, -73.7562), "boi": (43.6150, -116.2023),
+           "geg": (47.6588, -117.4260), "anc": (61.2181, -149.9003), "lit": (34.7465, -92.2896),
+           "dsm": (41.5868, -93.6250), "chs": (32.7765, -79.9311), "gsp": (34.8526, -82.3940),
+           "ict": (37.6872, -97.3301), "jan": (32.2988, -90.1848), "syr": (43.0481, -76.1474),
+           "rno": (39.5296, -119.8138), "crp": (27.8006, -97.3964), "lbb": (33.5779, -101.8552),
+           "ama": (35.2220, -101.8313), "shv": (32.5252, -93.7502), "sgf": (37.2090, -93.2923),
+           "pns": (30.4213, -87.2169), "tlh": (30.4383, -84.2807), "sav": (32.0809, -81.0912),
+           "rsw": (26.6406, -81.8723), "pwm": (43.6591, -70.2568), "fsd": (43.5446, -96.7311),
+           "far": (46.8772, -96.7898), "bil": (45.7833, -108.5007)}
+OFFERUP_FEED = ("query GetModularFeed($searchParams: [SearchParam]) { modularFeed(params: $searchParams) { "
+                "looseTiles { __typename ... on ModularFeedTileListing { listing { listingId title price "
+                "locationName sellerType image { url } } } } pageCursor } }")
+# в выдаче нет ни даты, ни продавца, ни описания — добираем одним запросом на страницу (алиасы l0…lN).
+# Круги городов пересекаются, а лента каждый круг отдаёт те же 50 — детали кэшируем, спрашиваем только новые id
+_offerup_det: dict[str, dict] = {}
+OFFERUP_LISTING = ("listingId postDate description owner { id profile { name dateJoined ratingSummary { count } "
+                   "isTruyouVerified isAutosDealer } }")
+
+
+async def offerup_gql(op, query, variables):
+    d = await get_json("offerup", "chrome", "https://offerup.com/api/graphql",
+                       headers={"Accept": "application/json", "Origin": "https://offerup.com",
+                                "Referer": "https://offerup.com/"},
+                       proxy=proxy_for("offerup", "us"), body={"operationName": op, "variables": variables, "query": query})
+    if d.get("errors"):  # GraphQL отвечает 200 и кладёт ошибку внутрь
+        raise RuntimeError(f"GraphQL: {d['errors'][0].get('message')}")
+    return d
+
+
+async def offerup(t, c, cursor):
+    lat, lon = OFFERUP[c]
+    # пустой q — другая лента без сортировки по дате; пробел даёт все объявления от новых к старым
+    params = {"q": t["query"] or " ", "SORT": "-posted", "platform": "web", "limit": 50, "lat": lat, "lon": lon,
+              "DISTANCE": 80, "PRICE_MIN": t["pmin"], "PRICE_MAX": t["pmax"], "pageCursor": cursor}
+    d = await offerup_gql("GetModularFeed", OFFERUP_FEED,
+                          {"searchParams": [{"key": k, "value": str(v)} for k, v in params.items() if v]})
+    feed = (d.get("data") or {}).get("modularFeed") or {}
+    tiles = [x["listing"] for x in items_of(feed, "looseTiles") if x.get("__typename") == "ModularFeedTileListing"]
+    if new := [x["listingId"] for x in tiles if x["listingId"] not in _offerup_det]:
+        ids = {f"l{n}": i for n, i in enumerate(new)}
+        q = (f"query GetListings({', '.join(f'${k}: ID!' for k in ids)}) {{ "
+             + " ".join(f"{k}: listing(listingId: ${k}) {{ {OFFERUP_LISTING} }}" for k in ids) + " }")
+        if len(_offerup_det) > 100_000:  # снятые с продажи и старые больше не всплывут — сбрасываем целиком
+            _offerup_det.clear()
+        _offerup_det.update({v["listingId"]: v for v in (await offerup_gql("GetListings", q, ids))["data"].values() if v})
+    det = _offerup_det
+    now = datetime.datetime.now(datetime.timezone.utc)
+    return (parse_each(tiles, lambda o: offerup_item(o, det.get(o["listingId"]), now, not t.get("bulk")), c),
+            feed.get("pageCursor") if tiles else None)
+
+
+def offerup_item(o, det, now, fresh=True):
+    posted = _to_dt((det or {}).get("postDate"))
+    # снято с продажи (деталей нет); при fresh — ещё платно поднятые старые: встают в выдачу как новые
+    if not posted or fresh and (now - posted).total_seconds() > 86400:
+        return None
+    owner = det.get("owner") or {}
+    profile = owner.get("profile") or {}
+    joined = _to_dt(profile.get("dateJoined"))
+    return dict(
+        id=o["listingId"],
+        title=o.get("title", ""),
+        price=float(o["price"]) if o.get("price") else None,
+        currency="USD",
+        brand="",
+        details="",
+        location=", ".join(filter(None, [o.get("locationName"), flag("us")])),
+        photo=(o.get("image") or {}).get("url"),
+        url=f"https://offerup.com/item/detail/{o['listingId']}",
+        market="offerup",
+        country="us",
+        seller_id=owner.get("id"),
+        seller_username=profile.get("name"),
+        seller_reviews=(profile.get("ratingSummary") or {}).get("count") or 0,
+        seller_account_days=(now - joined).days if joined else None,
+        seller_business=o.get("sellerType") not in (None, "C2C") or bool(profile.get("isAutosDealer")),
+        seller_verified=["личность"] if profile.get("isTruyouVerified") else None,
+        description=det.get("description"),
+        ts=posted.timestamp(),
+    )
+
+
+# площадка → одна страница выдачи: (task, страна/рынок, курсор) → (объявления, курсор следующей страницы или None)
 SITES = {"depop": depop, "vinted": vinted, "poshmark": poshmark, "wallapop": wallapop, "milanuncios": milanuncios,
-         "olx": olx}
+         "olx": olx, "offerup": offerup}
+# Индекс поиска Wallapop обновляется пачками раз в ~5 мин: за это время по популярному запросу выходит
+# больше 40 (одна страница), поэтому мониторинг берёт 2 страницы
+MONITOR_PAGES = {"wallapop": 2}
 # площадки, чей поиск отдаёт новые объявления с задержкой (замерено): (сколько ждать, мин. разумная свежесть)
-SLOW_FEED = {"wallapop": ("1–6 мин", 15), "olx": ("7–20 мин", 30)}
+# OfferUp прячет новые объявления из поиска на ~30 мин (замерено: веб, app-заголовки и старый search — одинаково)
+SLOW_FEED = {"wallapop": ("1–6 мин", 15), "olx": ("7–20 мин", 30), "offerup": ("~30 мин", 45)}
 COUNTRIES = {
     "depop": ["gb", "us", "au", "de", "fr", "it", "ie"],
     "vinted": VINTED_EU + ["us"],
@@ -766,12 +850,36 @@ COUNTRIES = {
     "wallapop": ["es"],
     "milanuncios": ["es"],
     "olx": list(OLX),
+    "offerup": list(OFFERUP),
 }
+
+
+def task_geos(t):
+    """Страны/рынки, по которым идёт поиск задачи: у Vinted — каталоги, у остальных — страны."""
+    return vinted_markets(t) if t["site"] == "vinted" else (t["country"] or ",".join(COUNTRIES[t["site"]])).split(",")
+
+
+async def fetch_new(t):
+    """Мониторинг: первые страницы выдачи каждой страны. Упала часть — вернём текст ошибки вместе с объявлениями."""
+    out, errors = [], []
+    geos = task_geos(t)
+    for g in geos:
+        cursor = None
+        try:
+            for _ in range(MONITOR_PAGES.get(t["site"], 1)):
+                items, cursor = await SITES[t["site"]](t, g, cursor)
+                out += items
+                if not cursor:
+                    break
+        except Exception as e:
+            log.warning(f"{t['site']} search error {g}: {e}")
+            errors.append((g, str(e)))
+    return fetch_result(out, errors, len(geos))
 
 # ---------- Прокси по площадкам ----------
 
 # страны, для которых можно назначить свой прокси; у Vinted — каталоги: eu (vinted.de), es (vinted.es), us (vinted.com)
-PROXY_GEOS = {**COUNTRIES, "vinted": ["eu", "es", "us"]}
+PROXY_GEOS = {**COUNTRIES, "vinted": ["eu", "es", "us"], "offerup": ["us"]}  # OfferUp — один прокси США на все города
 VINTED_GEO = {"vinted.de": "eu", "vinted.es": "es", "vinted.com": "us"}
 
 
@@ -840,14 +948,16 @@ def flag(cc):
 # ---------- Фильтрация ----------
 
 
+def price_ok(t, price):
+    if price is None:  # обмен / цена не указана — под фильтр цены не подходит
+        return not (t["pmin"] or t["pmax"])
+    return not (t["pmin"] and price < t["pmin"] or t["pmax"] and price > t["pmax"])
+
+
 async def should_show_item(item, t, site):
     now = time.time()
 
-    if (t["pmin"] or t["pmax"]) and item["price"] is None:  # обмен / цена не указана — под фильтр цены не подходит
-        return False, None
-    if t["pmin"] and item["price"] < t["pmin"]:
-        return False, None
-    if t["pmax"] and item["price"] > t["pmax"]:
+    if not price_ok(t, item["price"]):
         return False, None
 
     item_age_min = (now - item["ts"]) / 60
@@ -858,7 +968,9 @@ async def should_show_item(item, t, site):
     if t["private_only"] and item.get("seller_business"):  # Vinted и Milanuncios отдают тип продавца прямо в поиске
         return False, None
 
-    if site in ("milanuncios", "olx"):  # профиля в API нет — всё о продавце приходит прямо в выдаче
+    if site in ("milanuncios", "olx", "offerup"):  # профиля в API нет — всё о продавце приходит прямо в выдаче
+        if t["min_reviews"] and (item.get("seller_reviews") or 0) < t["min_reviews"]:
+            return False, None
         if t["min_account_days"] and (item.get("seller_account_days") or 0) < t["min_account_days"]:
             return False, None
         text = "\n".join(filter(None, [item.get("seller_name"), item.get("contact_name"), item.get("description")]))
@@ -921,6 +1033,9 @@ async def should_show_item(item, t, site):
     return True, item
 
 
+SITE_NAMES = {"olx": "OLX", "offerup": "OfferUp"}
+
+
 def card(t, i):
     e = html.escape
     if i["price"] is None:
@@ -951,14 +1066,14 @@ def card(t, i):
     if "contacts" in i:  # контакты искали — показываем всегда, даже если пусто
         contacts = i["contacts"]
         lines.append(f"✉️ Email: {e(', '.join(contacts.get('emails') or ['не найден']))}")
-        site_name = {"olx": "OLX"}.get(t["site"], t["site"].capitalize())
+        site_name = SITE_NAMES.get(t["site"], t["site"].capitalize())
         hidden = f"скрыт {site_name} — есть, смотри в объявлении" if i.get("phone_hidden") else "не найден"
         lines.append(f"📞 Тел: {e(', '.join(contacts.get('phones') or [hidden]))}")
 
     if i.get("posted"):
         lines.append(f"🕒 {i['posted']}")
 
-    name = {"olx": "OLX"}.get(t["site"], t["site"].capitalize())
+    name = SITE_NAMES.get(t["site"], t["site"].capitalize())
     lines.append(f"🔗 <a href=\"{e(i['url'])}\">Открыть на {name}</a>")
     lines.append(f"🔎 #{t['id']}: {e(query_label(t['query']))}")
     return "\n".join(lines)
@@ -1067,7 +1182,7 @@ _chat_locks: dict[int, asyncio.Lock] = {}
 
 async def check(bot, t):
     search, minus = split_query(t["query"])
-    items, partial = await SITES[t["site"]]({**dict(t), "query": search})
+    items, partial = await fetch_new({**dict(t), "query": search})
     items = list({str(i["id"]): i for i in items}.values())  # одно объявление может прийти дважды
     if t["site"] in ("depop", "vinted", "poshmark", "wallapop") and items and not any(i.get("seller_id") for i in items) \
             and (t["min_reviews"] or t["min_account_days"] or t["contacts_only"]):
@@ -1246,6 +1361,122 @@ async def poll(bot):
             log.exception("цикл проверки упал — продолжаю со следующего")
         await asyncio.sleep(INTERVAL)
 
+# ---------- Быстрый парс ----------
+
+FAST_MAX = 10_000
+FAST_COUNTS = (100, 250, 500, 1000, 5000)
+UNDATED = {"vinted", "depop"}  # не отдают дату публикации в выдаче — период по ним не выбрать
+_fast_stops: dict = {}  # (chat_id, id сообщения прогресса) → Event «стоп» для быстрого парса «с этого момента»
+
+
+def fast_prep(t):
+    current_chat.set(t["chat_id"])
+    search, minus = split_query(t["query"])
+    hidden = {r[0] for r in db.execute("select seller from hidden where chat_id=? and site=?", (t["chat_id"], t["site"]))}
+    return {**t, "query": search}, hidden, minus
+
+
+def fast_add(t, i, got, hidden, minus):
+    """Фильтры быстрого парса (цена, скрытые продавцы, минус-слова) и контакты из текста; прошло — кладём в got."""
+    if not price_ok(t, i["price"]) or str(i.get("seller_id")) in hidden or \
+            any(w in f"{i.get('title', '')} {i.get('brand', '')} {i.get('description') or ''}".lower() for w in minus):
+        return
+    # местные форматы телефонов — по стране объявления, иначе по стране задачи, если она одна
+    countries = t["country"].split(",")
+    local = [i.get("country") or (countries[0] if len(countries) == 1 else "")]
+    i["contacts"] = extract_contacts(
+        "\n".join(filter(None, [i.get("seller_name"), i.get("contact_name"), i.get("description")])), local)
+    got.setdefault(str(i["id"]), i)
+
+
+async def harvest(t, n, got):
+    """Быстрый парс: листает выдачу всех стран параллельно, пока в got не наберётся n объявлений или выдача не
+    кончится. t["max_age"] (мин) — только опубликованные за этот период. Профили продавцов не грузим — с ними это
+    минуты, а не секунды. Возвращает текст ошибок ("" — всё ок)."""
+    t, hidden, minus = fast_prep(t)
+    t["bulk"] = True
+    cutoff = time.time() - t["max_age"] * 60 if t.get("max_age") else 0
+    errors = []
+
+    async def walk(geo):
+        cursor, fails, idle = None, 0, 0
+        while len(got) < n:
+            try:
+                items, cursor = await SITES[t["site"]](t, geo, cursor)
+            except Exception as e:  # get_json уже сменил сессию и прокси — пробуем ту же страницу ещё раз
+                fails += 1
+                if fails == 3:
+                    errors.append((geo, str(e)))
+                    return
+                await asyncio.sleep(2 * fails)
+                continue
+            fails, before = 0, len(got)
+            for i in items:
+                if not cutoff or i["ts"] >= cutoff:
+                    fast_add(t, i, got, hidden, minus)
+            # ponytail: 3 страницы подряд без новых — выдача кончилась или ушла за период (поднятые/правленые
+            # старые объявления мешают оборвать на первом старом); страховка и от вечного курсора
+            idle = idle + 1 if len(got) == before else 0
+            if not cursor or idle == 3:
+                return
+
+    await asyncio.gather(*(walk(g) for g in task_geos(t)))
+    return "; ".join(f"{g}: {e[:100]}" for g, e in errors)
+
+
+async def watch(t, n, got, stop):
+    """Быстрый парс «с этого момента»: раз в INTERVAL первые страницы выдачи, как в мониторинге. Берём объявления,
+    которых не было в выдаче при старте. Где площадка отдаёт дату — ещё и опубликованные не раньше старта минус
+    задержка её поиска (Wallapop показывает объявление через 7–13 мин): так отсекаются поднятые и правленые старые.
+    Крутится, пока не наберётся n или не нажмут «стоп». Возвращает текст ошибок ("" — всё ок)."""
+    t, hidden, minus = fast_prep(t)
+    start, seen, fails, err = time.time(), None, 0, ""
+    since = start - SLOW_FEED.get(t["site"], ("", 5))[1] * 60
+    while len(got) < n and not stop.is_set():
+        try:
+            items, err = await fetch_new(t)
+            fails = 0
+            if seen is not None:  # первый ответ — снимок «что уже было», из него ничего не берём
+                for i in items:
+                    if str(i["id"]) not in seen and i.get("ts", start) >= since:
+                        fast_add(t, i, got, hidden, minus)
+            seen = (seen or set()) | {str(i["id"]) for i in items}
+        except Exception as e:  # упали все страны
+            fails, err = fails + 1, str(e)[:300]
+            if fails == 3:
+                return err
+        try:
+            await asyncio.wait_for(stop.wait(), INTERVAL)
+        except asyncio.TimeoutError:
+            pass
+    return err
+
+
+def fast_txt(t, items):
+    lines = [f"{t['site'].upper()} · {query_label(t['query'])} · {countries_text(t['site'], t['country'])}"
+             + (f" · цена {price_text(t['pmin'], t['pmax'])}" if t["pmin"] or t["pmax"] else "")
+             + (f" · {t['period']}" if t["period"] else ""),
+             f"Собрано: {len(items)} · {datetime.datetime.now(TZ):%d.%m.%Y %H:%M}", ""]
+    for n, i in enumerate(items, 1):
+        note = i.get("price_note")
+        price = (note or "цена не указана") if i["price"] is None else \
+            f"{i['price']:g} {i['currency']}" + (f" ({note})" if note else "")
+        seller = i.get("seller_username") or i.get("seller_name")
+        contacts = i["contacts"]["phones"] + i["contacts"]["emails"]
+        lines += filter(None, [
+            f"{n}. {i['title']}",
+            f"Цена: {price}",
+            (i.get("brand") or i.get("details")) and "Детали: " + " · ".join(filter(None, [i.get("brand"), i.get("details")])),
+            i.get("location") and f"Место: {i['location']}",
+            seller and f"Продавец: {seller}" + (" (профи)" if i.get("seller_business") else ""),
+            contacts and "Контакты: " + ", ".join(contacts),
+            "ts" in i and f"Опубликовано: {datetime.datetime.fromtimestamp(i['ts'], TZ):%d.%m.%Y %H:%M}",
+            i.get("photo") and f"Фото: {i['photo']}",
+            i["url"],
+        ])
+        lines.append("")
+    return "\n".join(lines)
+
 # ---------- Telegram UI ----------
 
 dp = Dispatcher()
@@ -1254,9 +1485,11 @@ if ALLOWED:
     dp.callback_query.filter(F.from_user.id.in_(ALLOWED))
 
 BTN_NEW, BTN_LIST, BTN_STOP, BTN_GO = "🔍 Новый поиск", "📋 Мои задачи", "⏹️ Стоп", "▶️ Запустить все"
+BTN_FAST = "⚡ Быстрый парс"
 MENU = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text=BTN_NEW), KeyboardButton(text=BTN_LIST)],
-              [KeyboardButton(text=BTN_STOP), KeyboardButton(text=BTN_GO)]],
+              [KeyboardButton(text=BTN_STOP), KeyboardButton(text=BTN_GO)],
+              [KeyboardButton(text=BTN_FAST)]],
     resize_keyboard=True, is_persistent=True,
 )
 AGES = {0: "Любой", 15: "15 мин", 30: "30 мин", 60: "1 час", 360: "6 часов", 1440: "1 день"}
@@ -1268,6 +1501,8 @@ class New(StatesGroup):
     price = State()
     age = State()
     seller_filters = State()
+    period = State()  # быстрый парс: за какой период или «с этого момента»
+    count = State()  # быстрый парс: сколько объявлений собрать
 
 
 def kb(rows):
@@ -1295,7 +1530,7 @@ def countries_text(site, country):
     codes = country.split(",") if country else []
     if not codes or len(codes) == len(COUNTRIES[site]):
         return "🌍 все страны"
-    return " ".join(map(flag, codes))
+    return " ".join(flag(c) or c.upper() for c in codes)  # у OfferUp не страны, а города
 
 
 def price_text(lo, hi):
@@ -1374,7 +1609,7 @@ def countries_kb(site, chosen):
 def countries_prompt(d):
     site = d["site"]
     text = (f"✏️ Правка #{d['edit']} <b>{site.upper()}</b> — страны:" if "edit" in d
-            else f"<b>{site.upper()}</b> — выбери страны (можно несколько):")
+            else f"{'⚡ ' if d.get('fast') else ''}<b>{site.upper()}</b> — выбери страны (можно несколько):")
     return text, countries_kb(site, d["countries"])
 
 
@@ -1394,6 +1629,7 @@ async def cmd_start(m: Message, state: FSMContext):
         f"• Мин. возраст аккаунта (дней)\n"
         f"• Только объявления с email/телефоном\n"
         f"• Только частные продавцы (без профи и магазинов)\n\n"
+        f"⚡ Быстрый парс — сразу собрать N объявлений из выдачи в .txt\n\n"
         f"Скрытые продавцы — /hidden · свои прокси — /proxy · статистика — /stats · лимит карточек — /limit\n"
         f"Твой id: <code>{m.from_user.id}</code>",
         reply_markup=MENU,
@@ -1404,6 +1640,16 @@ async def cmd_start(m: Message, state: FSMContext):
 async def new_search(m: Message, state: FSMContext):
     await state.clear()
     await m.answer("Выбери площадку:", reply_markup=sites_kb())
+
+
+@dp.message(F.text == BTN_FAST)
+async def fast_search(m: Message, state: FSMContext):
+    await state.clear()
+    await state.update_data(fast=True)
+    await m.answer("⚡ <b>Быстрый парс</b>: листаю выдачу за выбранный период (или жду новые с этого момента), "
+                   "пока не соберу нужное число объявлений, и присылаю .txt.\n"
+                   "Без фильтров продавца — профили не грузятся, поэтому быстро.\n\nВыбери площадку:",
+                   reply_markup=sites_kb())
 
 
 @dp.message(F.text == BTN_LIST)
@@ -1679,7 +1925,8 @@ async def pick_site(c: CallbackQuery, state: FSMContext):
     site = c.data[5:]
     if site not in SITES:
         return await c.answer()
-    await state.set_data({"site": site, "countries": []})
+    fast = (await state.get_data()).get("fast")
+    await state.set_data({"site": site, "countries": [], **({"fast": True} if fast else {})})
     await state.set_state(New.countries)
     text, markup = countries_prompt(await state.get_data())
     await c.message.edit_text(text, reply_markup=markup)
@@ -1739,8 +1986,7 @@ async def got_price(m: Message, state: FSMContext):
     except ValueError:
         return await m.answer("Не понял цену. Примеры: <code>10-50</code>, <code>до 50</code>, <code>от 10</code>")
     await state.update_data(pmin=pmin, pmax=pmax)
-    await state.set_state(New.age)
-    text, markup = age_prompt(await state.get_data())
+    text, markup = await after_price(state)
     await m.answer(text, reply_markup=markup)
 
 
@@ -1748,10 +1994,16 @@ async def got_price(m: Message, state: FSMContext):
 async def any_price(c: CallbackQuery, state: FSMContext):
     await state.update_data(pmin=None, pmax=None)
     await c.message.edit_reply_markup(reply_markup=None)
-    await state.set_state(New.age)
-    text, markup = age_prompt(await state.get_data())
+    text, markup = await after_price(state)
     await c.message.answer(text, reply_markup=markup)
     await c.answer()
+
+
+async def after_price(state):
+    """После цены быстрый парс спрашивает период, задача мониторинга — свежесть."""
+    d = await state.get_data()
+    await state.set_state(New.period if d.get("fast") else New.age)
+    return (period_prompt if d.get("fast") else age_prompt)(d)
 
 
 SELLER_NOTES = {
@@ -1787,7 +2039,8 @@ def query_prompt(d):
 def currencies(site, countries):
     if site == "vinted":
         return sorted({"USD" if c == "us" else "EUR" for c in countries})
-    table = {"depop": DEPOP_CURRENCY, "poshmark": {"us": "USD", "ca": "CAD"}, "olx": OLX_CURRENCY}.get(site)
+    table = {"depop": DEPOP_CURRENCY, "poshmark": {"us": "USD", "ca": "CAD"}, "olx": OLX_CURRENCY,
+             "offerup": dict.fromkeys(OFFERUP, "USD")}.get(site)
     return sorted({table[c] for c in countries}) if table else ["EUR"]  # Wallapop, Milanuncios
 
 
@@ -1825,12 +2078,29 @@ def seller_prompt(d):
             kb([[("Пропустить (0 0 0 0)", "seller:skip")]] + keep_row(d, cur, "seller_filters") + [BACK_ROW]))
 
 
+FAST_PERIODS = {**AGES, 4320: "3 дня", 10080: "7 дней"}
+
+
+def period_prompt(d):
+    now_row = [("🆕 С этого момента", "per:new")]
+    if d["site"] in UNDATED:
+        return (f"🕒 За какой период собрать?\n<i>{d['site'].capitalize()} не отдаёт дату публикации — период не "
+                f"выбрать: вся выдача или только новые с этого момента</i>",
+                kb([[("Любой", "per:0")], now_row, BACK_ROW]))
+    periods = list(FAST_PERIODS.items())
+    return ("🕒 За какой период собрать объявления? Или ждать новые с этого момента",
+            kb([[(txt, f"per:{v}") for v, txt in periods[i:i + 3]] for i in range(0, len(periods), 3)]
+               + [now_row, BACK_ROW]))
+
+
 # шаг мастера → предыдущий шаг и его вопрос
 BACK = {
     New.query.state: (New.countries, countries_prompt),
     New.price.state: (New.query, query_prompt),
     New.age.state: (New.price, price_prompt),
     New.seller_filters.state: (New.age, age_prompt),
+    New.period.state: (New.price, price_prompt),
+    New.count.state: (New.period, period_prompt),
 }
 
 
@@ -1838,7 +2108,8 @@ BACK = {
 async def go_back(c: CallbackQuery, state: FSMContext):
     st, d = await state.get_state(), await state.get_data()
     if st == New.countries.state:  # первый шаг: новая задача — к выбору площадки, правка — к списку задач
-        await state.clear()
+        await state.set_state(None)
+        await state.set_data({"fast": True} if d.get("fast") else {})  # быстрый парс остаётся быстрым
         text, markup = render_list(c.message.chat.id) if "edit" in d else ("Выбери площадку:", sites_kb())
     elif st in BACK:
         prev, prompt = BACK[st]
@@ -1848,6 +2119,98 @@ async def go_back(c: CallbackQuery, state: FSMContext):
         return await c.answer(f"Начни заново: «{BTN_NEW}»", show_alert=True)
     await c.message.edit_text(text, reply_markup=markup)
     await c.answer()
+
+
+@dp.callback_query(New.period, F.data.regexp(r"^per:(\d+|new)$"))
+async def got_period(c: CallbackQuery, state: FSMContext):
+    v = c.data[4:]
+    if v != "new" and int(v) not in FAST_PERIODS:
+        return await c.answer()
+    await state.update_data(since_now=v == "new", max_age=None if v == "new" else int(v) or None)
+    await state.set_state(New.count)
+    text, markup = count_prompt(await state.get_data())
+    await c.message.edit_text(text, reply_markup=markup)
+    await c.answer()
+
+
+def count_prompt(d):
+    return (f"🔢 Сколько объявлений собрать? Выбери или напиши число до {FAST_MAX}",
+            kb([[(str(n), f"cnt:{n}") for n in FAST_COUNTS], BACK_ROW]))
+
+
+@dp.callback_query(F.data == "fstop")
+async def fast_stop(c: CallbackQuery):
+    stop = _fast_stops.get((c.message.chat.id, c.message.message_id))
+    if stop:
+        stop.set()
+    await c.answer("Останавливаю — пришлю собранное" if stop else "Уже завершено")
+
+
+@dp.callback_query(New.count, F.data.regexp(r"^cnt:\d+$"))
+async def got_count_btn(c: CallbackQuery, state: FSMContext):
+    await c.message.edit_reply_markup(reply_markup=None)
+    await c.answer()
+    await run_fast(c.message, state, int(c.data[4:]))
+
+
+@dp.message(New.count, F.text)
+async def got_count(m: Message, state: FSMContext):
+    s = m.text.strip()
+    if not s.isdecimal() or not 1 <= int(s) <= FAST_MAX:
+        return await m.answer(f"Нужно число от 1 до {FAST_MAX}")
+    await run_fast(m, state, int(s))
+
+
+async def run_fast(m: Message, state: FSMContext, n):
+    d = await state.get_data()
+    await state.clear()
+    t = {"site": d["site"], "country": ",".join(d["countries"]), "query": d["query"], "pmin": d["pmin"],
+         "pmax": d["pmax"], "max_age": d.get("max_age"), "chat_id": m.chat.id}
+    since_now = d.get("since_now")
+    t["period"] = (f"с {datetime.datetime.now(TZ):%H:%M}" if since_now else
+                   f"за {FAST_PERIODS[t['max_age']]}" if t["max_age"] else "")
+    head = f"{t['site'].upper()} «{html.escape(query_label(t['query']))}»" + (f" {t['period']}" if t["period"] else "")
+    got, start, stop = {}, time.monotonic(), asyncio.Event()
+    if since_now:
+        stop_kb = kb([[("⏹️ Стоп — прислать собранное", "fstop")]])
+        lag = f"\n⏳ {t['site'].upper()} отдаёт новые с задержкой {SLOW_FEED[t['site']][0]}" if t["site"] in SLOW_FEED else ""
+        progress = lambda: (f"⚡ {head}: собрано {len(got)} из {n}. Жду новые объявления, проверяю выдачу "
+                            f"раз в {INTERVAL} сек.{lag}")
+    else:
+        stop_kb, progress = None, lambda: f"⚡ {head}: собрано {len(got)} из {n}…"
+    msg = await m.answer(progress(), reply_markup=stop_kb)
+    key = (m.chat.id, msg.message_id)
+    _fast_stops[key] = stop
+    job = asyncio.create_task(watch(t, n, got, stop) if since_now else harvest(t, n, got))
+    try:
+        while not job.done():
+            await asyncio.wait({job}, timeout=3)
+            if not job.done():
+                try:
+                    await msg.edit_text(progress(), reply_markup=stop_kb)
+                except TelegramBadRequest:  # «message is not modified» — число не выросло
+                    pass
+    finally:
+        _fast_stops.pop(key, None)
+    try:
+        err = job.result()
+    except Exception as e:
+        log.exception("быстрый парс %s %r упал", t["site"], t["query"])
+        return await msg.edit_text(f"⚠️ {head}: быстрый парс упал\n<code>{html.escape(str(e)[:300])}</code>")
+    items = list(got.values())[:n]
+    warn = (f"\n⚠️ Не парсится: <code>{html.escape(err[:400])}</code>" if err else "") + \
+           ("\nСайт блокирует IP — нужен прокси: /proxy" if "HTTP 403" in err else "")
+    if not items:
+        return await msg.edit_text(f"😕 {head}: ничего не нашлось{warn}")
+    short = ("" if len(items) == n or err else
+             "\nОстановлено — присылаю, что успел собрать." if since_now else
+             "\nЗа выбранный период больше объявлений нет." if t["max_age"] else
+             "\nВыдача кончилась раньше — больше объявлений площадка не отдаёт.")
+    name = re.sub(r"[^\w-]+", "_", query_label(t["query"]))[:40]
+    await m.answer_document(
+        BufferedInputFile(fast_txt(t, items).encode(), f"{t['site']}_{name}_{len(items)}.txt"),
+        caption=f"⚡ {head}: {len(items)} из {n} за {fmt_duration(time.monotonic() - start)}{short}{warn}")
+    await msg.delete()
 
 
 @dp.callback_query(New.age, F.data.regexp(r"^age:\d+$"))
