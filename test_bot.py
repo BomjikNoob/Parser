@@ -3,6 +3,8 @@ import sqlite3
 import bot
 from bot import extract_contacts, flag, parse_price, posted_at, split_query
 
+SCHEMA = [r[0] for r in bot.db.execute("select sql from sqlite_master where sql is not null and name not like 'sqlite_%'")]
+
 assert parse_price("10-50") == (10, 50)
 assert parse_price("до 50") == (None, 50) == parse_price("50")
 assert parse_price("от 10,5") == (10.5, None)
@@ -61,6 +63,17 @@ det = lambda h: {"postDate": (now_dt - bot.datetime.timedelta(hours=h)).isoforma
 assert bot.offerup_item(o, det(1), now_dt)["seller_business"] and bot.offerup_item(o, None, now_dt, False) is None
 assert bot.offerup_item(o, det(48), now_dt) is None and bot.offerup_item(o, det(48), now_dt, False)["price"] == 10
 
+# OfferUp: фильтр продаж — «0» ровно ноль, диапазон включительно
+sold = lambda n: bot.offerup_item(o, {**det(1), "owner": {"id": 1, "profile": {"itemsSold": str(n)}}}, now_dt, False)
+task = lambda lo, hi: {"pmin": None, "pmax": None, "max_age": None, "private_only": 0, "min_reviews": 0,
+                       "min_account_days": 0, "contacts_only": 0, "min_sold": lo, "max_sold": hi}
+show = lambda n, lo, hi: bot.asyncio.run(bot.should_show_item(sold(n), task(lo, hi), "offerup"))[0]
+assert show(0, 0, 0) and not show(1, 0, 0) and show(35, 0, None)
+assert show(5, 5, 50) and show(50, 5, 50) and not show(4, 5, 50) and not show(51, 5, 50)
+assert bot.sold_text(0, 0) == "0" and bot.sold_text(0, None) == "" and bot.sold_text(5, 50) == "5–50"
+assert [bot.short_count(s) for s in (35, "35", "1,234", "1.2K", "3M+", None, "", "n/a")] == [35, 35, 1234, 1200,
+                                                                                         3_000_000, 0, 0, 0]
+
 # время публикации по меткам id: id 100 видели в t=0, id 200 — в t=600
 bot.db = sqlite3.connect(":memory:")
 bot.db.execute("create table marks(site text, max_id int, ts real)")
@@ -85,4 +98,74 @@ bot.db.executemany("insert into seen values(?,?,?)",
                    [(1, "old", 0), (1, "kept", 9 * day), (1, "new", 10 * day), (2, "paused", 0)])
 bot.prune_seen()
 assert {r[0] for r in bot.db.execute("select item_id from seen")} == {"kept", "new", "paused"}
+
+
+def fresh_db():
+    db = sqlite3.connect(":memory:")
+    db.row_factory = sqlite3.Row
+    for sql in SCHEMA:
+        db.execute(sql)
+    return db
+
+
+# город, ответивший пустой выдачей, — известный: первое объявление оттуда приходит, а не глотается как «прогрев»
+bot.db = fresh_db()
+tid = bot.db.execute("insert into tasks(chat_id, site, country, query, started_at) values(1, 'offerup', 'us', '', 0)").lastrowid
+one = {**sold(3), "src": "lax"}
+answers = iter([([], "", ["nyc", "lax"]), ([one], "", ["nyc", "lax"])])
+sent_items = []
+
+
+async def fake_fetch(t):
+    return next(answers)
+
+
+async def fake_send(_, t, i):
+    sent_items.append(i["id"])
+
+
+bot.fetch_new, bot.send = fake_fetch, fake_send
+row = lambda: bot.db.execute("select * from tasks where id=?", (tid,)).fetchone()
+bot.asyncio.run(bot.check(None, row()))
+bot.asyncio.run(bot.check(None, row()))
+assert sent_items == ["a"] and row()["checked"] == 1, (sent_items, row()["checked"])  # пустой снимок + одно новое
+
+# планировщик: медленная задача не задерживает быструю
+bot.db = fresh_db()
+bot.db.executemany("insert into tasks(id, chat_id, site, country, query) values(?, 1, 'olx', '', '')", [(1,), (2,)])
+bot.INTERVAL, calls = 0, []
+
+
+async def fake_run(_, t):
+    calls.append(t["id"])
+    await bot.asyncio.sleep(60 if t["id"] == 1 else 0)
+
+
+async def run_poll():
+    bot.run = fake_run
+    try:
+        await bot.asyncio.wait_for(bot.poll(None), 3.5)
+    except TimeoutError:
+        pass
+
+bot.calibrate = lambda: bot.asyncio.sleep(0)
+bot.asyncio.run(run_poll())
+assert calls.count(1) == 1 and calls.count(2) >= 3, calls
+
+# «с этого момента»: страна, упавшая на старте, ожив, не присылает всю свою выдачу как новую (1600);
+# объявление с id старше всех меток (800) — поднятое старое, хоть и стоит в выдаче первым
+bot.db = fresh_db()
+bot.db.execute("insert into marks values('m', 1000, ?)", (bot.time.time() - 3600,))
+it = lambda i, src: {"id": i, "src": src, "price": 5, "market": "m"}
+answers = iter([([it(1500, "de")], "fr: HTTP 500", ["de"]),
+                ([it(1600, "fr"), it(1500, "de")], "", ["de", "fr"]),
+                ([it(800, "de"), it(1500, "de"), it(1700, "fr"), it(1600, "fr")], "", ["de", "fr"])])
+
+
+async def fake_fetch(t, parallel=1):
+    return next(answers)
+
+bot.fetch_new, got = fake_fetch, {}
+fast_t = {"site": "vinted", "country": "de,fr", "query": "", "pmin": None, "pmax": None, "chat_id": 1}
+assert bot.asyncio.run(bot.watch(fast_t, 1, got, bot.asyncio.Event())) == "" and list(got) == ["1700"], got
 print("ok")

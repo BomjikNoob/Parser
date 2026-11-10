@@ -23,8 +23,8 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, Teleg
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import (BotCommand, BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
-                           KeyboardButton, LinkPreviewOptions, Message, ReplyKeyboardMarkup)
+from aiogram.types import (BotCommand, BufferedInputFile, CallbackQuery, ErrorEvent, InlineKeyboardButton,
+                           InlineKeyboardMarkup, KeyboardButton, LinkPreviewOptions, Message, ReplyKeyboardMarkup)
 from curl_cffi.requests import AsyncSession
 
 ROOT = Path(__file__).parent
@@ -42,7 +42,7 @@ PROXY_LIST = [p.strip() for p in os.getenv("PROXIES", "").split(",") if p.strip(
 PROXIES = itertools.cycle(PROXY_LIST or [None])
 TZ = ZoneInfo(os.environ["TIMEZONE"]) if os.getenv("TIMEZONE") else None  # None — часовой пояс компьютера
 MAX_PER_CYCLE = 10  # карточек за проверку на задачу по умолчанию; свой лимит чата — /limit
-LIMITS = (5, 10, 20, 30, 50)
+LIMITS = (5, 10, 20, 50, 100, 300, 0)  # 0 — без лимита
 SEEN_TTL = 2 * 86400  # объявление пропало из выдачи на 2 суток — забываем его
 CAPTION_MAX = 1024  # лимит Telegram на подпись к фото
 
@@ -53,7 +53,7 @@ db.row_factory = sqlite3.Row
 # --- Схема (сразу с новыми колонками) ---
 db.executescript("""
 create table if not exists tasks(
-    id integer primary key,
+    id integer primary key autoincrement,
     chat_id int,
     site text,
     query text,
@@ -84,7 +84,10 @@ for _col, _ddl in [
     ("min_account_days", "integer default 0"),
     ("contacts_only", "integer default 0"),
     ("private_only", "integer default 0"),
+    ("min_sold", "integer default 0"),  # OfferUp: продажи продавца (Sold) от…до; max_sold null — без верхней границы
+    ("max_sold", "integer"),
     ("started_at", "real"),  # когда задачу запустили (создание, правка, снятие с паузы) — для «Время» в статусе
+    ("checked", "integer default 0"),  # сколько разных объявлений проверено с started_at — для статуса
 ]:
     if _col not in _existing_cols:
         db.execute(f"alter table tasks add column {_col} {_ddl}")
@@ -99,6 +102,16 @@ if "task_id" not in {row[1] for row in db.execute("pragma table_info(sent)")}:
 if "summary" not in {row[1] for row in db.execute("pragma table_info(sent)")}:
     db.execute("alter table sent add column summary text")  # «название - цена · место» для статуса задачи
 db.execute("update tasks set started_at=? where started_at is null", (time.time(),))
+db.execute("update tasks set country='us' where site='offerup'")  # раньше OfferUp выбирали по городам
+_tasks_sql = db.execute("select sql from sqlite_master where name='tasks'").fetchone()[0]
+if "autoincrement" not in _tasks_sql.lower():
+    # без autoincrement номер удалённой задачи доставался новой — вместе с её «последней проверкой» и карточками
+    db.commit()
+    db.execute("begin")  # одной транзакцией: упали посередине — задачи остаются в старой таблице
+    db.execute("alter table tasks rename to tasks_old")
+    db.execute(re.sub(r"(?i)\bid integer primary key\b", "id integer primary key autoincrement", _tasks_sql, count=1))
+    db.execute("insert into tasks select * from tasks_old")
+    db.execute("drop table tasks_old")
 if "chat_id" not in {row[1] for row in db.execute("pragma table_info(proxies)")}:
     # прокси стали личными (chat_id; 0 — общий): добавленные раньше достаются админу, админа нет — общими
     db.execute("alter table proxies rename to proxies_old")
@@ -111,6 +124,7 @@ last_error: dict[int, str] = {}  # текущая проблема задачи:
 alerted: dict[int, str] = {}  # о каком состоянии ("fail"/"partial") уже написали в чат
 streak: dict[int, tuple] = {}  # (состояние, сколько проверок подряд оно держится)
 last_check: dict[int, float] = {}  # когда задача последний раз проверялась — для статуса
+checking: dict[int, list] = {}  # идущая проверка задачи: [пройдено стран/точек, всего] — для статуса
 ALERT_AFTER = 2  # о поломке пишем, только если она держится 2 проверки подряд: разовый таймаут — не повод
 
 
@@ -388,6 +402,7 @@ def vinted_item(i, market):
         seller_username=user_data.get("login"),
         seller_business=bool(user_data.get("business")),
         market=market,
+        bumped=bool(i.get("promoted")),  # поднятое за деньги — в «с этого момента» не новое
     )
 
 # ---------- Кэш продавцов ----------
@@ -731,9 +746,12 @@ def olx_item(o, c, host, now, fresh=True):
 
 # ---------- OfferUp ----------
 
-# Поиск OfferUp локальный (радиус жёстко до 80 миль, общенациональной ленты нет), поэтому «страны» — сетка
-# агломераций США (коды аэропортов): код → (lat, lon). Все вместе покрывают населённую часть страны.
-# ponytail: 80 точек ≈ 30 с на круг через одну сессию (первый — ~60 с); глухие районы (WY, ND…) не покрыты — добавить точки
+# Поиск OfferUp локальный (радиус жёстко до 80 миль, общенациональной ленты нет), поэтому выбор один — «US»,
+# а ищем по сетке США: код → (lat, lon). Сначала 80 агломераций (коды аэропортов), за ними 152 малых города, каждый
+# дальше 80 миль от агломераций (все проверены: отдают местную выдачу). Без них выпадали WY, MT, ND, Аляска, острова…
+# ponytail: 232 точки по очереди ≈ 75 с на круг (первый ~2.5 мин); при ~30 мин задержки OfferUp и ~25 мин на страницу
+# в NYC потерь нет.
+# Щели между кругами (<80 миль от центров) не закрыты — нужна точка, добавь её сюда же
 OFFERUP = {"nyc": (40.7128, -74.0060), "lax": (34.0522, -118.2437), "chi": (41.8781, -87.6298),
            "hou": (29.7604, -95.3698), "dfw": (32.7767, -96.7970), "phx": (33.4484, -112.0740),
            "phl": (39.9526, -75.1652), "sat": (29.4241, -98.4936), "san": (32.7157, -117.1611),
@@ -760,18 +778,74 @@ OFFERUP = {"nyc": (40.7128, -74.0060), "lax": (34.0522, -118.2437), "chi": (41.8
            "ama": (35.2220, -101.8313), "shv": (32.5252, -93.7502), "sgf": (37.2090, -93.2923),
            "pns": (30.4213, -87.2169), "tlh": (30.4383, -84.2807), "sav": (32.0809, -81.0912),
            "rsw": (26.6406, -81.8723), "pwm": (43.6591, -70.2568), "fsd": (43.5446, -96.7311),
-           "far": (46.8772, -96.7898), "bil": (45.7833, -108.5007)}
+           "far": (46.8772, -96.7898), "bil": (45.7833, -108.5007),
+           # малые города вне кругов агломераций
+           "jnu": (58.3019, -134.4197), "rap": (44.0805, -103.2310), "isn": (48.1470, -103.6180),
+           "cmx": (47.1211, -88.5694), "cec": (41.7558, -124.2026), "fve": (47.2587, -68.5895),
+           "fai": (64.8378, -147.7164), "lbf": (41.1239, -100.7654), "pga": (36.9147, -111.4558),
+           "ito": (19.7074, -155.0885), "ciu": (46.4953, -84.3453), "hvr": (48.5500, -109.6841),
+           "inl": (48.6011, -93.4107), "gjt": (39.0639, -108.5506), "fst": (30.8940, -102.8793),
+           "but": (46.0038, -112.5348), "gck": (37.9717, -100.8727), "jac": (43.4799, -110.7624),
+           "eko": (40.8324, -115.7631), "lkv": (42.1888, -120.3458), "eps": (44.9062, -66.9900),
+           "bkw": (37.7782, -81.1882), "cpr": (42.8501, -106.3252), "tph": (38.0670, -117.2301),
+           "als": (37.4695, -105.8700), "bis": (46.8083, -100.7837), "auw": (44.9591, -89.6301),
+           "row": (33.3943, -104.5230), "bff": (41.8666, -103.6672), "pdt": (45.6721, -118.7886),
+           "mli": (41.5067, -90.5151), "rks": (41.5875, -109.2029), "sjt": (31.4638, -100.4370),
+           "fca": (48.1920, -114.3168), "yum": (32.6927, -114.6277), "drt": (29.3709, -100.8959),
+           "pir": (44.3683, -100.3510), "pbg": (44.6995, -73.4529), "fmn": (36.7281, -108.2187),
+           "ggw": (48.1970, -106.6367), "dlh": (46.7867, -92.1005), "jkm": (45.6262, -70.2568),
+           "rif": (38.7725, -112.0841), "lch": (30.2266, -93.2174), "bro": (25.9017, -97.4975),
+           "ipt": (41.2412, -77.0011), "sow": (34.2542, -110.0298), "eyw": (24.5551, -81.7800),
+           "mls": (46.4083, -105.8406), "lrd": (27.5306, -99.4803), "gri": (40.9264, -98.3420),
+           "svc": (32.7701, -108.2803), "tvc": (44.7631, -85.6206), "wwr": (36.4337, -99.3904),
+           "rdd": (40.5865, -122.3917), "sps": (33.9137, -98.4934), "rdm": (44.0582, -121.3153),
+           "pah": (37.0834, -88.6000), "ely": (39.2474, -114.8886), "abr": (45.4647, -98.4865),
+           "cou": (38.9517, -92.3341), "bno": (43.5862, -119.0541), "ilm": (34.2257, -77.9447),
+           "twf": (42.5629, -114.4609), "cmi": (40.1164, -88.2434), "flg": (35.1983, -111.6513),
+           "lse": (43.8014, -91.2396), "oth": (43.3665, -124.2179), "omk": (48.4110, -119.5276),
+           "stb": (40.4850, -106.8317), "apn": (45.0617, -83.4327), "sgu": (37.0965, -113.5684),
+           "mcw": (43.1536, -93.2010), "gcc": (44.2911, -105.5022), "lih": (21.9811, -159.3711),
+           "tcc": (35.1717, -103.7250), "goo": (39.3508, -101.7101), "fwa": (41.0793, -85.1394),
+           "ekn": (38.9257, -79.8467), "riw": (43.0247, -108.3801), "hys": (38.8792, -99.3268),
+           "ykm": (46.6021, -120.5059), "cds": (34.4265, -100.2040), "fsm": (35.3859, -94.3985),
+           "gtf": (47.5053, -111.3008), "vtn": (42.8728, -100.5510), "wmc": (40.9730, -117.7357),
+           "mtp": (41.0359, -71.9545), "pof": (36.7570, -90.3929), "msl": (34.7998, -87.6773),
+           "mot": (48.2330, -101.2923), "cha": (35.0456, -85.3097), "uki": (39.1502, -123.2078),
+           "lfk": (31.3382, -94.7291), "ogs": (44.6942, -75.4863), "bji": (47.4736, -94.8803),
+           "ags": (33.4735, -82.0105), "esc": (45.7453, -87.0646), "axn": (45.8852, -95.3775),
+           "nee": (34.8481, -114.6141), "csg": (32.4610, -84.9877), "lam": (38.0872, -102.6208),
+           "gmo": (36.6828, -101.4816), "mlu": (32.5093, -92.1193), "dik": (46.8792, -102.7896),
+           "pih": (42.8713, -112.4455), "leb": (43.6423, -72.2518), "flo": (34.1954, -79.7626),
+           "gun": (38.5458, -106.9253), "lyh": (37.4138, -79.1422), "ogg": (20.8893, -156.4729),
+           "gtr": (33.4957, -88.4273), "sbp": (35.2828, -120.6596), "mso": (46.8721, -113.9940),
+           "cod": (44.5263, -109.0565), "tri": (36.3134, -82.3535), "pkb": (39.2667, -81.5615),
+           "ofk": (42.0328, -97.4170), "mcc": (44.9110, -116.0987), "maf": (31.9973, -102.0779),
+           "ack": (41.2835, -70.0995), "pucu": (39.5994, -110.8107), "mbs": (43.4195, -83.9508),
+           "lws": (46.4165, -117.0177), "gup": (35.5281, -108.7426), "bgr": (44.8012, -68.7778),
+           "pub": (38.2544, -104.6091), "glh": (33.4101, -91.0618), "act": (31.5493, -97.1467),
+           "smn": (45.1758, -113.8959), "irk": (40.1948, -92.5833), "bwd": (31.7093, -98.9912),
+           "vrb": (27.6386, -80.3973), "sby": (38.3607, -75.5994), "mry": (36.6002, -121.8947),
+           "dhn": (31.2232, -85.3905), "pib": (31.3271, -89.2903), "grb": (44.5133, -88.0133),
+           "aex": (31.3113, -92.4451), "spw": (43.1414, -95.1442), "aoo": (40.5187, -78.3947),
+           "mca": (34.9334, -95.7697), "evv": (37.9716, -87.5711), "hqm": (46.9754, -123.8157),
+           "loz": (37.1290, -84.0833), "sln": (38.8403, -97.6114), "wpl": (36.7281, -91.8524),
+           "eri": (42.1292, -80.0851), "snk": (32.7179, -100.9176), "ykr": (41.7354, -122.6345),
+           "bih": (37.3635, -118.3951), "vel": (40.4555, -109.5287)}
 OFFERUP_FEED = ("query GetModularFeed($searchParams: [SearchParam]) { modularFeed(params: $searchParams) { "
                 "looseTiles { __typename ... on ModularFeedTileListing { listing { listingId title price "
                 "locationName sellerType image { url } } } } pageCursor } }")
 # в выдаче нет ни даты, ни продавца, ни описания — добираем одним запросом на страницу (алиасы l0…lN).
 # Круги городов пересекаются, а лента каждый круг отдаёт те же 50 — детали кэшируем, спрашиваем только новые id
 _offerup_det: dict[str, dict] = {}
+# ponytail: замер — ~9.5 тыс. записей на запрос за круг (~4 МБ в pickle); 50 тыс. хватает ~5 разным запросам
+OFFERUP_DET_MAX = 50_000
 OFFERUP_LISTING = ("listingId postDate description owner { id profile { name dateJoined ratingSummary { count } "
-                   "isTruyouVerified isAutosDealer } }")
+                   "isTruyouVerified isAutosDealer itemsSold } }")
 
 
 async def offerup_gql(op, query, variables):
+    # одна сессия — запросы по очереди (~3 в секунду). 4 параллельные сессии (~300 запросов за минуту)
+    # получили 429 на весь IP на ~15 мин
     d = await get_json("offerup", "chrome", "https://offerup.com/api/graphql",
                        headers={"Accept": "application/json", "Origin": "https://offerup.com",
                                 "Referer": "https://offerup.com/"},
@@ -794,13 +868,20 @@ async def offerup(t, c, cursor):
         ids = {f"l{n}": i for n, i in enumerate(new)}
         q = (f"query GetListings({', '.join(f'${k}: ID!' for k in ids)}) {{ "
              + " ".join(f"{k}: listing(listingId: ${k}) {{ {OFFERUP_LISTING} }}" for k in ids) + " }")
-        if len(_offerup_det) > 100_000:  # снятые с продажи и старые больше не всплывут — сбрасываем целиком
-            _offerup_det.clear()
+        if len(_offerup_det) > OFFERUP_DET_MAX:  # dict помнит порядок вставки — выкидываем самую давнюю треть
+            for k in list(itertools.islice(_offerup_det, OFFERUP_DET_MAX // 3)):
+                del _offerup_det[k]
         _offerup_det.update({v["listingId"]: v for v in (await offerup_gql("GetListings", q, ids))["data"].values() if v})
     det = _offerup_det
     now = datetime.datetime.now(datetime.timezone.utc)
     return (parse_each(tiles, lambda o: offerup_item(o, det.get(o["listingId"]), now, not t.get("bulk")), c),
             feed.get("pageCursor") if tiles else None)
+
+
+def short_count(s):
+    """Счётчик профиля: 35, "35", "1,234", "1.2K", "3M+" → int; непонятное — 0."""
+    m = re.fullmatch(r"(\d[\d,]*(?:\.\d+)?)\s*([kKmM]?)\+?", str(s or 0).strip())
+    return int(float(m[1].replace(",", "")) * {"": 1, "k": 1000, "m": 1_000_000}[m[2].lower()]) if m else 0
 
 
 def offerup_item(o, det, now, fresh=True):
@@ -829,6 +910,7 @@ def offerup_item(o, det, now, fresh=True):
         seller_account_days=(now - joined).days if joined else None,
         seller_business=o.get("sellerType") not in (None, "C2C") or bool(profile.get("isAutosDealer")),
         seller_verified=["личность"] if profile.get("isTruyouVerified") else None,
+        seller_sold=short_count(profile.get("itemsSold")),
         description=det.get("description"),
         ts=posted.timestamp(),
     )
@@ -838,8 +920,8 @@ def offerup_item(o, det, now, fresh=True):
 SITES = {"depop": depop, "vinted": vinted, "poshmark": poshmark, "wallapop": wallapop, "milanuncios": milanuncios,
          "olx": olx, "offerup": offerup}
 # Индекс поиска Wallapop обновляется пачками раз в ~5 мин: за это время по популярному запросу выходит
-# больше 40 (одна страница), поэтому мониторинг берёт 2 страницы
-MONITOR_PAGES = {"wallapop": 2}
+# больше 40 (одна страница), поэтому мониторинг берёт 2 страницы; Depop отдаёт 24 за страницу — тоже 2
+MONITOR_PAGES = {"wallapop": 2, "depop": 2}
 # площадки, чей поиск отдаёт новые объявления с задержкой (замерено): (сколько ждать, мин. разумная свежесть)
 # OfferUp прячет новые объявления из поиска на ~30 мин (замерено: веб, app-заголовки и старый search — одинаково)
 SLOW_FEED = {"wallapop": ("1–6 мин", 15), "olx": ("7–20 мин", 30), "offerup": ("~30 мин", 45)}
@@ -850,36 +932,56 @@ COUNTRIES = {
     "wallapop": ["es"],
     "milanuncios": ["es"],
     "olx": list(OLX),
-    "offerup": list(OFFERUP),
+    "offerup": ["us"],  # внутри — все точки OFFERUP, см. task_geos
 }
 
 
 def task_geos(t):
-    """Страны/рынки, по которым идёт поиск задачи: у Vinted — каталоги, у остальных — страны."""
+    """Страны/рынки, по которым идёт поиск задачи: у Vinted — каталоги, у OfferUp — города США, у остальных — страны."""
+    if t["site"] == "offerup":
+        return list(OFFERUP)
     return vinted_markets(t) if t["site"] == "vinted" else (t["country"] or ",".join(COUNTRIES[t["site"]])).split(",")
 
 
-async def fetch_new(t):
-    """Мониторинг: первые страницы выдачи каждой страны. Упала часть — вернём текст ошибки вместе с объявлениями."""
-    out, errors = [], []
-    geos = task_geos(t)
-    for g in geos:
-        cursor = None
-        try:
-            for _ in range(MONITOR_PAGES.get(t["site"], 1)):
-                items, cursor = await SITES[t["site"]](t, g, cursor)
-                out += items
-                if not cursor:
-                    break
-        except Exception as e:
-            log.warning(f"{t['site']} search error {g}: {e}")
-            errors.append((g, str(e)))
-    return fetch_result(out, errors, len(geos))
+async def fetch_new(t, parallel=1):
+    """Мониторинг: первые страницы выдачи каждой страны. Упала часть — вернём текст ошибки вместе с объявлениями.
+    Третьим — страны/рынки, ответившие без ошибки (даже пустой выдачей). parallel — сколько стран/точек
+    запрашивать одновременно: мониторингу хватает по одной, быстрому парсу по сотням точек OfferUp — нет."""
+    geos, tid, done = task_geos(t), t.get("id"), [0]  # id нет у быстрого парса — ему прогресс не нужен
+    sem = asyncio.Semaphore(parallel)
+
+    async def one(g):
+        got, cursor, err = [], None, None
+        async with sem:
+            try:
+                for _ in range(MONITOR_PAGES.get(t["site"], 1)):
+                    items, cursor = await SITES[t["site"]](t, g, cursor)
+                    got += items
+                    if not cursor:
+                        break
+            except Exception as e:
+                log.warning(f"{t['site']} search error {g}: {e}")
+                err = str(e)
+        done[0] += 1
+        if tid:
+            checking[tid] = [done[0], len(geos)]
+        return got, err
+
+    if tid:
+        checking[tid] = [0, len(geos)]
+    try:
+        res = await asyncio.gather(*(one(g) for g in geos))
+    finally:
+        checking.pop(tid, None)
+    out = [i for got, _ in res for i in got]
+    errors = [(g, e) for g, (_, e) in zip(geos, res) if e]
+    failed = {g for g, _ in errors}
+    return (*fetch_result(out, errors, len(geos)), [g for g in geos if g not in failed])
 
 # ---------- Прокси по площадкам ----------
 
 # страны, для которых можно назначить свой прокси; у Vinted — каталоги: eu (vinted.de), es (vinted.es), us (vinted.com)
-PROXY_GEOS = {**COUNTRIES, "vinted": ["eu", "es", "us"], "offerup": ["us"]}  # OfferUp — один прокси США на все города
+PROXY_GEOS = {**COUNTRIES, "vinted": ["eu", "es", "us"]}
 VINTED_GEO = {"vinted.de": "eu", "vinted.es": "es", "vinted.com": "us"}
 
 
@@ -973,6 +1075,9 @@ async def should_show_item(item, t, site):
             return False, None
         if t["min_account_days"] and (item.get("seller_account_days") or 0) < t["min_account_days"]:
             return False, None
+        sold = item.get("seller_sold", 0)
+        if sold < (t["min_sold"] or 0) or t["max_sold"] is not None and sold > t["max_sold"]:
+            return False, None
         text = "\n".join(filter(None, [item.get("seller_name"), item.get("contact_name"), item.get("description")]))
         item["contacts"] = extract_contacts(text, [item["country"]])  # имя продавца тоже: магазины пишут туда номер
         if t["contacts_only"] and not any(item["contacts"].values()):
@@ -1058,7 +1163,8 @@ def card(t, i):
         what = "продаж" if t["site"] == "poshmark" else "отзывов"
         pro = " · профи" if i.get("seller_business") else ""
         verified = f" · ✔️ подтверждены: {', '.join(i['seller_verified'])}" if i.get("seller_verified") else ""
-        lines.append(f"👤 Продавец{e(who)}{pro}: {i.get('seller_reviews', 0)} {what} | {days} дней на площадке{verified}")
+        sold = f", {i['seller_sold']} продано" if "seller_sold" in i else ""
+        lines.append(f"👤 Продавец{e(who)}{pro}: {i.get('seller_reviews', 0)} {what}{sold} | {days} дней на площадке{verified}")
     elif i.get("seller_name"):
         days = f" | {i['seller_account_days']} дней на площадке" if i.get("seller_account_days") is not None else ""
         lines.append(f"👤 Продавец: {e(i['seller_name'])} · {'профи' if i.get('seller_business') else 'частный'}{days}")
@@ -1079,9 +1185,13 @@ def card(t, i):
     return "\n".join(lines)
 
 
-def seller_kb(site, seller, hidden=False):
-    return kb([[("↩️ Вернуть продавца", f"unhide:{site}:{seller}") if hidden else
-                ("🚫 Скрыть продавца", f"hide:{site}:{seller}")]])
+def seller_row(site, seller, hidden=False):
+    return [("↩️ Вернуть продавца", f"unhide:{site}:{seller}") if hidden else
+            ("🚫 Скрыть продавца", f"hide:{site}:{seller}")]
+
+
+def run_row(tid, active=True):
+    return [("⏹️ Остановить задачу", f"tstop:{tid}") if active else ("▶️ Запустить снова", f"tstart:{tid}")]
 
 
 async def send(bot, t, i):
@@ -1089,7 +1199,8 @@ async def send(bot, t, i):
     if i.get("photo") and len(text) > CAPTION_MAX:  # подпись к фото — до 1024 символов: укорачиваем название
         cut = len(text) - CAPTION_MAX + 1
         text = card(t, {**i, "title": i["title"][:max(20, len(i["title"]) - cut)] + "…"})
-    markup = seller_kb(t["site"], i["seller_id"]) if i.get("seller_id") else None
+    rows = [seller_row(t["site"], i["seller_id"])] if i.get("seller_id") else []
+    markup = kb(rows + [run_row(t["id"])])
     for _ in range(3):
         try:
             if i.get("photo"):
@@ -1136,7 +1247,7 @@ def posted_at(market, item_id, now):
 def estimate_ts(items, now):
     """Время публикации для площадок без даты (Vinted, Depop) — по id через метки. Выдача отсортирована по
     публикации, а id выдаётся при создании черновика: опубликованный позже черновик имеет «старый» id. Поэтому
-    объявление не старше любого, что стоит ниже него в выдаче, — берём максимум по хвосту."""
+    объявление не старше любого, что стоит ниже него в той же выдаче (страна/рынок), — берём максимум по хвосту."""
     floor = {}
     for i in reversed(items):
         if "ts" in i:
@@ -1145,10 +1256,22 @@ def estimate_ts(items, now):
             ts, older = posted_at(i["market"], int(i["id"]), now)
         except (ValueError, TypeError):
             ts, older = now, False
-        if floor.get(i["market"], ts) > ts:
-            ts, older = floor[i["market"]], False
-        floor[i["market"]] = ts
+        feed = i["market"], i.get("src")  # у Depop рынок один на все страны, а выдачи у стран свои
+        if floor.get(feed, ts) > ts:
+            ts, older = floor[feed], False
+        floor[feed] = ts
         i["ts"], i["ts_older"] = ts, older
+
+
+def stamp(items, now):
+    """Метка «самый большой id на сейчас» по каждому рынку без даты и оценка времени публикации по меткам."""
+    for market in {i["market"] for i in items if "ts" not in i}:
+        try:
+            max_id = max(int(i["id"]) for i in items if i["market"] == market)
+            record_mark(market, max_id, now)
+        except ValueError:
+            pass
+    estimate_ts(items, now)
 
 
 def posted_text(ts, older, now):
@@ -1182,7 +1305,7 @@ _chat_locks: dict[int, asyncio.Lock] = {}
 
 async def check(bot, t):
     search, minus = split_query(t["query"])
-    items, partial = await fetch_new({**dict(t), "query": search})
+    items, partial, answered = await fetch_new({**dict(t), "query": search})
     items = list({str(i["id"]): i for i in items}.values())  # одно объявление может прийти дважды
     if t["site"] in ("depop", "vinted", "poshmark", "wallapop") and items and not any(i.get("seller_id") for i in items) \
             and (t["min_reviews"] or t["min_account_days"] or t["contacts_only"]):
@@ -1193,13 +1316,7 @@ async def check(bot, t):
         last_error.pop(t["id"], None)
     now = time.time()
 
-    for market in {i["market"] for i in items if "ts" not in i}:
-        try:
-            max_id = max(int(i["id"]) for i in items if i["market"] == market)
-            record_mark(market, max_id, now)
-        except ValueError:
-            pass
-    estimate_ts(items, now)
+    stamp(items, now)
     hidden = {r[0] for r in db.execute("select seller from hidden where chat_id=? and site=?", (t["chat_id"], t["site"]))}
 
     fresh = []
@@ -1220,11 +1337,13 @@ async def check(bot, t):
         - {i["src"] for i in items if str(i["id"]) not in fresh_ids}
 
     out, retry, profile_err = [], [], None
+    evaluated = 0  # для «Проверено»: пропущенные сверх лимита карточек не проверялись
     if t["primed"]:
         for n, i in enumerate(fresh):
             if i["src"] in new_src or str(i.get("seller_id")) in hidden or \
                     any(w in f"{i.get('title', '')} {i.get('brand', '')} {i.get('description') or ''}".lower()
                         for w in minus):
+                evaluated += i["src"] not in new_src
                 continue
             try:
                 should_show, processed_item = await should_show_item(i, t, t["site"])
@@ -1236,9 +1355,10 @@ async def check(bot, t):
                     log.info("task #%s: %s, отложено объявлений: %s", t["id"], e, len(retry))
                     break
                 continue  # один битый профиль не держит остальную выдачу
+            evaluated += 1
             if should_show and processed_item:
                 out.append(processed_item)
-            if len(out) >= limit:
+            if limit and len(out) >= limit:
                 if len(fresh) > n + 1:
                     log.info("task #%s: лимит %s карточек — старых пропущено: %s", t["id"], limit, len(fresh) - n - 1)
                 break
@@ -1254,8 +1374,12 @@ async def check(bot, t):
     pending = {str(i["id"]) for i in retry + out}
     db.executemany("insert or replace into seen values(?,?,?)",
                    [(t["id"], str(i["id"]), now) for i in items if str(i["id"]) not in pending])
-    db.executemany("insert or replace into seen values(?,?,?)", [(t["id"], f"src:{s}", now) for s in {i["src"] for i in items}])
-    db.execute("update tasks set primed=1 where id=?", (t["id"],))
+    # ответившие без ошибки — известны, даже с пустой выдачей: иначе первое объявление «тихого» города примем за прогрев
+    db.executemany("insert or replace into seen values(?,?,?)",
+                   [(t["id"], f"src:{s}", now) for s in {i["src"] for i in items} | set(answered)])
+    # первый снимок тоже просмотрен (иначе на OfferUp «Проверено» 0 первые ~4 мин), хоть из него ничего не шлём
+    db.execute("update tasks set primed=1, checked=checked+? where id=?",
+               (evaluated if t["primed"] else len(fresh), t["id"]))
     db.commit()
 
     async with _chat_locks.setdefault(t["chat_id"], asyncio.Lock()):
@@ -1331,16 +1455,22 @@ async def run(bot, t):
     head = f"Задача #{t['id']} {t['site'].upper()} «{html.escape(query_label(t['query']))}»"
     if state is None:
         text = f"✅ {head} снова работает"
-        alerted.pop(t["id"], None)
     else:
         hint = "\n\nСайт блокирует IP — нужен прокси: /proxy (или PROXIES в .env)." if "HTTP 403" in err else ""
         what = "часть стран не парсится" if state == "partial" else "не парсится"
-        text = f"⚠️ {head}: {what}\n<code>{html.escape(err.removeprefix('часть не парсится — '))}</code>{hint}"
-        alerted[t["id"]] = state
+        # ошибки сотен точек OfferUp легко перерастают лимит Telegram (4096) — режем до экранирования
+        detail = err.removeprefix("часть не парсится — ")
+        detail = detail[:1500] + ("…" if len(detail) > 1500 else "")
+        text = f"⚠️ {head}: {what}\n<code>{html.escape(detail)}</code>{hint}"
     try:
         await bot.send_message(t["chat_id"], text)
     except Exception as ex2:
         log.warning("alert #%s: %s", t["id"], ex2)
+        return  # не дошло — попробуем в следующем круге
+    if state is None:
+        alerted.pop(t["id"], None)
+    else:
+        alerted[t["id"]] = state
 
 
 def prune_seen():
@@ -1351,22 +1481,46 @@ def prune_seen():
     db.commit()
 
 
-async def poll(bot):
+async def service_loop():
+    """Калибровка меток времени и чистка seen — своим кругом, задачи их не ждут."""
     while True:
         try:
             await calibrate()
-            await asyncio.gather(*(run(bot, t) for t in db.execute("select * from tasks where active=1").fetchall()))
             prune_seen()
-        except Exception:  # любой сбой цикла не должен молча остановить парсинг, пока бот продолжает отвечать
-            log.exception("цикл проверки упал — продолжаю со следующего")
+        except Exception:
+            log.exception("калибровка/чистка упала — продолжаю со следующего круга")
         await asyncio.sleep(INTERVAL)
+
+
+async def poll(bot):
+    """У каждой задачи свой круг: следующая проверка — через INTERVAL после конца предыдущей.
+    Медленная задача (мёртвый прокси, много городов) больше не держит остальные."""
+    running: dict[int, asyncio.Task] = {}
+    next_at: dict[int, float] = {}
+
+    def done(tid):
+        running.pop(tid, None)
+        next_at[tid] = time.time() + INTERVAL
+
+    service = asyncio.create_task(service_loop())  # noqa: F841 — ссылка держит задачу от сборщика мусора
+    while True:
+        try:
+            now = time.time()
+            for t in db.execute("select * from tasks where active=1").fetchall():
+                if t["id"] not in running and now >= next_at.get(t["id"], 0):
+                    running[t["id"]] = job = asyncio.create_task(run(bot, t))
+                    job.add_done_callback(lambda _, tid=t["id"]: done(tid))
+        except Exception:  # любой сбой не должен молча остановить парсинг, пока бот продолжает отвечать
+            log.exception("планировщик проверок упал — продолжаю")
+        await asyncio.sleep(1)
 
 # ---------- Быстрый парс ----------
 
 FAST_MAX = 10_000
 FAST_COUNTS = (100, 250, 500, 1000, 5000)
+FAST_PARALLEL = 8  # страниц быстрого парса одновременно: стран у площадок до 8, у OfferUp — сотни точек
 UNDATED = {"vinted", "depop"}  # не отдают дату публикации в выдаче — период по ним не выбрать
-_fast_stops: dict = {}  # (chat_id, id сообщения прогресса) → Event «стоп» для быстрого парса «с этого момента»
+_fast_stops: dict = {}  # (chat_id, id сообщения прогресса) → (Event «стоп», текст прогресса) идущего быстрого парса
 
 
 def fast_prep(t):
@@ -1376,9 +1530,10 @@ def fast_prep(t):
     return {**t, "query": search}, hidden, minus
 
 
-def fast_add(t, i, got, hidden, minus):
-    """Фильтры быстрого парса (цена, скрытые продавцы, минус-слова) и контакты из текста; прошло — кладём в got."""
-    if not price_ok(t, i["price"]) or str(i.get("seller_id")) in hidden or \
+def fast_add(t, i, got, hidden, minus, n):
+    """Фильтры быстрого парса (цена, скрытые продавцы, минус-слова) и контакты из текста; прошло — кладём в got.
+    Больше n не кладём: страницы других стран, ушедшие в сеть до набора, приходят следом."""
+    if len(got) >= n or not price_ok(t, i["price"]) or str(i.get("seller_id")) in hidden or \
             any(w in f"{i.get('title', '')} {i.get('brand', '')} {i.get('description') or ''}".lower() for w in minus):
         return
     # местные форматы телефонов — по стране объявления, иначе по стране задачи, если она одна
@@ -1389,20 +1544,25 @@ def fast_add(t, i, got, hidden, minus):
     got.setdefault(str(i["id"]), i)
 
 
-async def harvest(t, n, got):
-    """Быстрый парс: листает выдачу всех стран параллельно, пока в got не наберётся n объявлений или выдача не
-    кончится. t["max_age"] (мин) — только опубликованные за этот период. Профили продавцов не грузим — с ними это
-    минуты, а не секунды. Возвращает текст ошибок ("" — всё ок)."""
+async def harvest(t, n, got, stop):
+    """Быстрый парс: листает выдачу всех стран параллельно, пока в got не наберётся n объявлений, выдача не
+    кончится или не нажмут «стоп». t["max_age"] (мин) — только опубликованные за этот период. Профили продавцов не
+    грузим — с ними это минуты, а не секунды. Возвращает текст ошибок ("" — всё ок)."""
     t, hidden, minus = fast_prep(t)
     t["bulk"] = True
     cutoff = time.time() - t["max_age"] * 60 if t.get("max_age") else 0
     errors = []
+    # не больше FAST_PARALLEL страниц в полёте: у OfferUp 232 точки — иначе все уже стоят в очереди, когда n набрано
+    sem = asyncio.Semaphore(FAST_PARALLEL)
 
     async def walk(geo):
         cursor, fails, idle = None, 0, 0
-        while len(got) < n:
+        while len(got) < n and not stop.is_set():
             try:
-                items, cursor = await SITES[t["site"]](t, geo, cursor)
+                async with sem:
+                    if len(got) >= n or stop.is_set():  # набрали или нажали «стоп», пока ждали очереди
+                        return
+                    items, cursor = await SITES[t["site"]](t, geo, cursor)
             except Exception as e:  # get_json уже сменил сессию и прокси — пробуем ту же страницу ещё раз
                 fails += 1
                 if fails == 3:
@@ -1413,7 +1573,7 @@ async def harvest(t, n, got):
             fails, before = 0, len(got)
             for i in items:
                 if not cutoff or i["ts"] >= cutoff:
-                    fast_add(t, i, got, hidden, minus)
+                    fast_add(t, i, got, hidden, minus, n)
             # ponytail: 3 страницы подряд без новых — выдача кончилась или ушла за период (поднятые/правленые
             # старые объявления мешают оборвать на первом старом); страховка и от вечного курсора
             idle = idle + 1 if len(got) == before else 0
@@ -1424,23 +1584,39 @@ async def harvest(t, n, got):
     return "; ".join(f"{g}: {e[:100]}" for g, e in errors)
 
 
+def id_fresh(i, now, since):
+    """Объявление без даты (Vinted, Depop) создано не раньше since — по id через метки, без подъёма по выдаче:
+    estimate_ts поднимает стоящее наверху до соседей снизу, а поднятое старое как раз стоит наверху.
+    ponytail: черновик, созданный раньше since и опубликованный сейчас, тоже отсекается; точнее — только по дате
+    публикации, которой API Vinted/Depop не отдают."""
+    try:
+        ts, older = posted_at(i["market"], int(i["id"]), now)
+    except (ValueError, TypeError):
+        return True
+    return not older and ts >= since
+
+
 async def watch(t, n, got, stop):
     """Быстрый парс «с этого момента»: раз в INTERVAL первые страницы выдачи, как в мониторинге. Берём объявления,
-    которых не было в выдаче при старте. Где площадка отдаёт дату — ещё и опубликованные не раньше старта минус
-    задержка её поиска (Wallapop показывает объявление через 7–13 мин): так отсекаются поднятые и правленые старые.
+    которых не было в выдаче при старте и опубликованные не раньше старта минус задержка поиска площадки (SLOW_FEED,
+    иначе 5 мин): так отсекаются поднятые и правленые старые. У Vinted/Depop даты нет — время оцениваем по id.
     Крутится, пока не наберётся n или не нажмут «стоп». Возвращает текст ошибок ("" — всё ок)."""
     t, hidden, minus = fast_prep(t)
-    start, seen, fails, err = time.time(), None, 0, ""
+    start, seen, known, fails, err = time.time(), set(), set(), 0, ""
     since = start - SLOW_FEED.get(t["site"], ("", 5))[1] * 60
     while len(got) < n and not stop.is_set():
         try:
-            items, err = await fetch_new(t)
-            fails = 0
-            if seen is not None:  # первый ответ — снимок «что уже было», из него ничего не берём
-                for i in items:
-                    if str(i["id"]) not in seen and i.get("ts", start) >= since:
-                        fast_add(t, i, got, hidden, minus)
-            seen = (seen or set()) | {str(i["id"]) for i in items}
+            items, err, answered = await fetch_new(t, FAST_PARALLEL)
+            fails, now = 0, time.time()
+            stamp(items, now)
+            # страна/рынок берутся только после первого ответа без ошибки: он — снимок «что уже было». Иначе
+            # упавшая на старте страна, ожив, пришлёт всю свою выдачу как новую.
+            for i in items:
+                if i["src"] in known and str(i["id"]) not in seen and i["ts"] >= since and not i.get("bumped") \
+                        and ("ts_older" not in i or id_fresh(i, now, since)):
+                    fast_add(t, i, got, hidden, minus, n)
+            seen |= {str(i["id"]) for i in items}
+            known |= set(answered)
         except Exception as e:  # упали все страны
             fails, err = fails + 1, str(e)[:300]
             if fails == 3:
@@ -1470,7 +1646,8 @@ def fast_txt(t, items):
             i.get("location") and f"Место: {i['location']}",
             seller and f"Продавец: {seller}" + (" (профи)" if i.get("seller_business") else ""),
             contacts and "Контакты: " + ", ".join(contacts),
-            "ts" in i and f"Опубликовано: {datetime.datetime.fromtimestamp(i['ts'], TZ):%d.%m.%Y %H:%M}",
+            "ts" in i and f"Опубликовано: {'~' if 'ts_older' in i else ''}"  # ~ — оценка по id (Vinted, Depop)
+                          f"{datetime.datetime.fromtimestamp(i['ts'], TZ):%d.%m.%Y %H:%M}",
             i.get("photo") and f"Фото: {i['photo']}",
             i["url"],
         ])
@@ -1501,6 +1678,7 @@ class New(StatesGroup):
     price = State()
     age = State()
     seller_filters = State()
+    sold = State()  # OfferUp: сколько продаж у продавца
     period = State()  # быстрый парс: за какой период или «с этого момента»
     count = State()  # быстрый парс: сколько объявлений собрать
 
@@ -1530,7 +1708,7 @@ def countries_text(site, country):
     codes = country.split(",") if country else []
     if not codes or len(codes) == len(COUNTRIES[site]):
         return "🌍 все страны"
-    return " ".join(flag(c) or c.upper() for c in codes)  # у OfferUp не страны, а города
+    return " ".join(flag(c) or c.upper() for c in codes)
 
 
 def price_text(lo, hi):
@@ -1546,8 +1724,10 @@ def task_row(t):
     acc_age = f" 📅{t['min_account_days']}д+" if t["min_account_days"] else ""
     contacts = " 📧" if t["contacts_only"] else ""
     private = " 🙋частные" if t["private_only"] else ""
+    sold = sold_text(t["min_sold"], t["max_sold"])
+    sold = f" 📦{sold} продано" if sold else ""
     return (f"{'▶️' if t['active'] else '⏸️'} #{t['id']} {t['site'].upper()} «{e(query_label(t['query']))}»"
-            f"{price}{age}{reviews}{acc_age}{contacts}{private}"
+            f"{price}{age}{reviews}{acc_age}{contacts}{private}{sold}"
             f"\n   {countries_text(t['site'], t['country'])}{err}")
 
 
@@ -1570,12 +1750,16 @@ def render_status(t):
     last = db.execute("select summary from sent where task_id=? and summary is not null order by ts desc limit 3",
                       (t["id"],)).fetchall()
     lines = [f"📡 <b>Парсинг #{t['id']} в процессе</b>" if t["active"] else f"⏸️ <b>Парсинг #{t['id']} на паузе</b>",
-             "", task_row(t), "", f"Найдено объявлений: <b>{found}</b>"]
+             "", task_row(t), "", f"Проверено объявлений: <b>{t['checked']}</b>", f"Найдено объявлений: <b>{found}</b>"]
     if t["active"]:
         lines.append(f"Время: {fmt_duration(now - (t['started_at'] or now))}")
-        checked = last_check.get(t["id"])
-        lines.append(f"Последняя проверка: {fmt_duration(now - checked)} назад" if checked
-                     else f"Первая проверка — в течение {INTERVAL} сек.")
+        checked, running = last_check.get(t["id"]), checking.get(t["id"])
+        where = "точек" if t["site"] == "offerup" else "стран"
+        lines.append(f"Идёт проверка: пройдено {running[0]} из {running[1]} {where}" if running else
+                     f"Последняя проверка: {fmt_duration(now - checked)} назад" if checked else
+                     f"Первая проверка — в течение {INTERVAL} сек.")
+        if not t["primed"]:
+            lines.append("Первая проверка — снимок выдачи: что уже выложено, не присылаю, только новое.")
     if last:
         lines += ["", f"<b>Последние {len(last)} объявления:</b>",
                   "<blockquote>" + "\n".join(html.escape(r[0]) for r in last) + "</blockquote>"]
@@ -1594,7 +1778,7 @@ def task_kb(rows, page, pages):
     return kb([[(f"📊 #{t['id']}", f"st:{t['id']}"),
                 (f"{'⏸️' if t['active'] else '▶️'} #{t['id']}", f"toggle:{t['id']}:{page}"),
                 (f"✏️ #{t['id']}", f"edit:{t['id']}"),
-                (f"🗑 #{t['id']}", f"del:{t['id']}:{page}")] for t in rows] + [nav])
+                (f"🗑 #{t['id']}", f"del:{t['id']}:{page}")] for t in rows] + [nav, [("🗑 Удалить все", "delall")]])
 
 
 def countries_kb(site, chosen):
@@ -1731,12 +1915,18 @@ def chat_limit(chat_id):
     return row[0] if row else MAX_PER_CYCLE
 
 
+def limit_label(n):
+    return str(n) if n else "без лимита"
+
+
 def render_limit(chat_id):
     cur = chat_limit(chat_id)
-    return (f"📦 <b>Лимит карточек</b>: сейчас <b>{cur}</b> за проверку (~{INTERVAL} с) на каждую задачу.\n"
+    btns = [(("✅ " if n == cur else "") + ("∞" if not n else str(n)), f"limit:{n}") for n in LIMITS]
+    return (f"📦 <b>Лимит карточек</b>: сейчас <b>{limit_label(cur)}</b> за проверку на каждую задачу.\n"
             "Новых больше лимита — присылаю самые свежие, старые пропускаю: без очереди и отставания.\n"
-            "Большой лимит — больше трафика прокси на профили продавцов и риск флуд-лимита Telegram."), \
-        kb([[(f"✅ {n}" if n == cur else str(n), f"limit:{n}") for n in LIMITS]])
+            "∞ — без лимита: шлю всё подряд, ~1 карточка в секунду (лимит Telegram), следующая проверка задачи — "
+            "когда всё отправлено. Большой лимит — больше трафика прокси на профили продавцов."), \
+        kb([btns[:4], btns[4:]])
 
 
 @dp.message(Command("limit"))
@@ -1863,7 +2053,8 @@ async def stop_all(m: Message, state: FSMContext):
 @dp.message(F.text == BTN_GO)
 async def go_all(m: Message, state: FSMContext):
     await state.clear()
-    n = db.execute("update tasks set active=1, started_at=? where chat_id=? and active=0", (time.time(), m.chat.id)).rowcount
+    n = db.execute("update tasks set active=1, started_at=?, checked=0 where chat_id=? and active=0",
+                   (time.time(), m.chat.id)).rowcount
     db.commit()
     await m.answer(f"▶️ Запущено задач: {n}." if n else "Остановленных задач нет.", reply_markup=MENU)
 
@@ -2018,6 +2209,25 @@ NO_FILTER = {"milanuncios": (True, True, False), "olx": (True, False, False),
 SELLER_KEYS = ("min_reviews", "min_account_days", "contacts_only", "private_only")
 
 
+def sold_text(lo, hi):
+    """Диапазон продаж OfferUp: lo 0 — без нижней границы, hi None — без верхней."""
+    if hi is None:
+        return f"от {lo}" if lo else ""
+    if lo == hi:
+        return str(hi)
+    return f"{lo}–{hi}" if lo else f"до {hi}"
+
+
+def sold_prompt(d):
+    old = d.get("old") or {}
+    return ("📦 Сколько продаж (Sold) в профиле продавца OfferUp?\n\n"
+            "• <code>0</code> — только продавцы без продаж\n"
+            "• <code>5-50</code> — от 5 до 50\n"
+            "• <code>до 10</code> или <code>от 20</code>",
+            kb([[("Любое количество", "sold:any")]]
+               + keep_row(d, sold_text(old.get("min_sold") or 0, old.get("max_sold")) or "любое", "sold") + [BACK_ROW]))
+
+
 BACK_ROW = [("⬅️ Назад", "back")]
 
 
@@ -2040,7 +2250,7 @@ def currencies(site, countries):
     if site == "vinted":
         return sorted({"USD" if c == "us" else "EUR" for c in countries})
     table = {"depop": DEPOP_CURRENCY, "poshmark": {"us": "USD", "ca": "CAD"}, "olx": OLX_CURRENCY,
-             "offerup": dict.fromkeys(OFFERUP, "USD")}.get(site)
+             "offerup": {"us": "USD"}}.get(site)
     return sorted({table[c] for c in countries}) if table else ["EUR"]  # Wallapop, Milanuncios
 
 
@@ -2099,6 +2309,7 @@ BACK = {
     New.price.state: (New.query, query_prompt),
     New.age.state: (New.price, price_prompt),
     New.seller_filters.state: (New.age, age_prompt),
+    New.sold.state: (New.seller_filters, seller_prompt),
     New.period.state: (New.price, price_prompt),
     New.count.state: (New.period, period_prompt),
 }
@@ -2140,17 +2351,31 @@ def count_prompt(d):
 
 @dp.callback_query(F.data == "fstop")
 async def fast_stop(c: CallbackQuery):
-    stop = _fast_stops.get((c.message.chat.id, c.message.message_id))
-    if stop:
-        stop.set()
-    await c.answer("Останавливаю — пришлю собранное" if stop else "Уже завершено")
+    run = _fast_stops.get((c.message.chat.id, c.message.message_id))
+    if run:
+        run[0].set()
+    await c.answer("Останавливаю — пришлю собранное" if run else "Уже завершено")
+
+
+@dp.callback_query(F.data == "frefresh")
+async def fast_refresh(c: CallbackQuery):
+    run = _fast_stops.get((c.message.chat.id, c.message.message_id))
+    if not run:
+        return await c.answer("Уже завершено")
+    try:
+        await c.message.edit_text(run[1](), reply_markup=c.message.reply_markup)
+    except TelegramBadRequest:  # с прошлого обновления ничего не поменялось
+        pass
+    await c.answer("Обновлено")
 
 
 @dp.callback_query(New.count, F.data.regexp(r"^cnt:\d+$"))
 async def got_count_btn(c: CallbackQuery, state: FSMContext):
-    await c.message.edit_reply_markup(reply_markup=None)
+    d = await take_wizard(state)
     await c.answer()
-    await run_fast(c.message, state, int(c.data[4:]))
+    if d:
+        await c.message.edit_reply_markup(reply_markup=None)
+        await run_fast(c.message, d, int(c.data[4:]))
 
 
 @dp.message(New.count, F.text)
@@ -2158,12 +2383,22 @@ async def got_count(m: Message, state: FSMContext):
     s = m.text.strip()
     if not s.isdecimal() or not 1 <= int(s) <= FAST_MAX:
         return await m.answer(f"Нужно число от 1 до {FAST_MAX}")
-    await run_fast(m, state, int(s))
+    d = await take_wizard(state)
+    if d:
+        await run_fast(m, d, int(s))
 
 
-async def run_fast(m: Message, state: FSMContext, n):
+async def take_wizard(state: FSMContext):
+    """Данные мастера быстрого парса со сбросом шага. Между проверкой и сбросом нет переключений (MemoryStorage
+    отвечает сразу), поэтому двойное нажатие запускает один сбор: второму — None."""
+    if await state.get_state() != New.count.state:
+        return None
     d = await state.get_data()
     await state.clear()
+    return d
+
+
+async def run_fast(m: Message, d, n):
     t = {"site": d["site"], "country": ",".join(d["countries"]), "query": d["query"], "pmin": d["pmin"],
          "pmax": d["pmax"], "max_age": d.get("max_age"), "chat_id": m.chat.id}
     since_now = d.get("since_now")
@@ -2171,27 +2406,34 @@ async def run_fast(m: Message, state: FSMContext, n):
                    f"за {FAST_PERIODS[t['max_age']]}" if t["max_age"] else "")
     head = f"{t['site'].upper()} «{html.escape(query_label(t['query']))}»" + (f" {t['period']}" if t["period"] else "")
     got, start, stop = {}, time.monotonic(), asyncio.Event()
+    stop_kb = kb([[("🔄 Обновить", "frefresh")], [("⏹️ Стоп — прислать собранное", "fstop")]])
     if since_now:
-        stop_kb = kb([[("⏹️ Стоп — прислать собранное", "fstop")]])
         lag = f"\n⏳ {t['site'].upper()} отдаёт новые с задержкой {SLOW_FEED[t['site']][0]}" if t["site"] in SLOW_FEED else ""
+        # минуты, а не секунды: «Обновить» видно, что бот жив, а автообновление не чаще раза в минуту
         progress = lambda: (f"⚡ {head}: собрано {len(got)} из {n}. Жду новые объявления, проверяю выдачу "
-                            f"раз в {INTERVAL} сек.{lag}")
+                            f"раз в {INTERVAL} сек. Идёт {int(time.monotonic() - start) // 60} мин.{lag}")
     else:
-        stop_kb, progress = None, lambda: f"⚡ {head}: собрано {len(got)} из {n}…"
+        progress = lambda: f"⚡ {head}: собрано {len(got)} из {n}…"
     msg = await m.answer(progress(), reply_markup=stop_kb)
     key = (m.chat.id, msg.message_id)
-    _fast_stops[key] = stop
-    job = asyncio.create_task(watch(t, n, got, stop) if since_now else harvest(t, n, got))
+    _fast_stops[key] = stop, progress
+    job = asyncio.create_task(watch(t, n, got, stop) if since_now else harvest(t, n, got, stop))
+    shown = progress()
     try:
         while not job.done():
             await asyncio.wait({job}, timeout=3)
-            if not job.done():
+            if not job.done() and progress() != shown:  # число не выросло — Telegram не дёргаем
                 try:
                     await msg.edit_text(progress(), reply_markup=stop_kb)
-                except TelegramBadRequest:  # «message is not modified» — число не выросло
+                    shown = progress()
+                except TelegramRetryAfter as ex:  # флуд-лимит — пропускаем обновления, сбор не трогаем
+                    await asyncio.sleep(ex.retry_after)
+                except TelegramBadRequest:
                     pass
     finally:
         _fast_stops.pop(key, None)
+        if not job.done():  # обработчик прервался — не оставляем сбор крутиться впустую
+            job.cancel()
     try:
         err = job.result()
     except Exception as e:
@@ -2203,7 +2445,7 @@ async def run_fast(m: Message, state: FSMContext, n):
     if not items:
         return await msg.edit_text(f"😕 {head}: ничего не нашлось{warn}")
     short = ("" if len(items) == n or err else
-             "\nОстановлено — присылаю, что успел собрать." if since_now else
+             "\nОстановлено — присылаю, что успел собрать." if stop.is_set() else
              "\nЗа выбранный период больше объявлений нет." if t["max_age"] else
              "\nВыдача кончилась раньше — больше объявлений площадка не отдаёт.")
     name = re.sub(r"[^\w-]+", "_", query_label(t["query"]))[:40]
@@ -2228,7 +2470,7 @@ async def got_age(c: CallbackQuery, state: FSMContext):
 @dp.callback_query(New.seller_filters, F.data == "seller:skip")
 async def skip_seller_filters(c: CallbackQuery, state: FSMContext):
     await state.update_data(min_reviews=0, min_account_days=0, contacts_only=0, private_only=0)
-    await finish_task(c, state)
+    await after_seller(c, state)
 
 
 @dp.message(New.seller_filters, F.text)
@@ -2247,6 +2489,35 @@ async def got_seller_filters(m: Message, state: FSMContext):
     if (no_reviews and reviews) or (no_days and days) or (no_private and private):
         return await m.answer(f"{SELLER_NOTES[site]}\nВведи фильтры заново.")
     await state.update_data(min_reviews=reviews, min_account_days=days, contacts_only=contacts, private_only=private)
+    await after_seller(m, state)
+
+
+async def after_seller(target, state):
+    """У OfferUp после фильтров продавца — шаг «продажи», у остальных (и после него) задача готова."""
+    d = await state.get_data()
+    if d["site"] != "offerup" or await state.get_state() == New.sold.state:
+        return await finish_task(target, state)
+    await state.set_state(New.sold)
+    text, markup = sold_prompt(d)
+    if isinstance(target, Message):
+        await target.answer(text, reply_markup=markup)
+    else:
+        await target.message.edit_text(text, reply_markup=markup)
+
+
+@dp.callback_query(New.sold, F.data == "sold:any")
+async def any_sold(c: CallbackQuery, state: FSMContext):
+    await state.update_data(min_sold=0, max_sold=None)
+    await finish_task(c, state)
+
+
+@dp.message(New.sold, F.text)
+async def got_sold(m: Message, state: FSMContext):
+    try:
+        lo, hi = parse_price(m.text)  # голое число — «до N», поэтому «0» = ровно 0
+    except ValueError:
+        return await m.answer("Неверный формат. Примеры: <code>0</code>, <code>5-50</code>, <code>до 10</code>, <code>от 20</code>")
+    await state.update_data(min_sold=int(lo or 0), max_sold=None if hi is None else int(hi))
     await finish_task(m, state)
 
 
@@ -2256,6 +2527,7 @@ KEEP = {
     New.price.state: (("pmin", "pmax"), New.age, age_prompt),
     New.age.state: (("max_age",), New.seller_filters, seller_prompt),
     New.seller_filters.state: (SELLER_KEYS, None, None),
+    New.sold.state: (("min_sold", "max_sold"), None, None),
 }
 
 
@@ -2270,7 +2542,7 @@ async def keep_value(c: CallbackQuery, state: FSMContext):
     await state.update_data({k: d["old"][k] for k in keys})
     await c.answer()
     if nxt is None:
-        return await finish_task(c, state)
+        return await after_seller(c, state)
     await c.message.edit_reply_markup(reply_markup=None)
     await state.set_state(nxt)
     text, markup = prompt(await state.get_data())
@@ -2297,16 +2569,20 @@ async def finish_task(msg_or_callback, state: FSMContext):
         d.get("min_account_days", 0),
         d.get("contacts_only", 0),
         d.get("private_only", 0),
+        d.get("min_sold") or 0,
+        d.get("max_sold"),
     )
 
     dup = db.execute(
         "select id from tasks where chat_id=? and site=? and country=? and query=? and pmin is ? and pmax is ? "
-        "and max_age is ? and min_reviews=? and min_account_days=? and contacts_only=? and private_only=? and id!=?",
+        "and max_age is ? and min_reviews=? and min_account_days=? and contacts_only=? and private_only=? "
+        "and min_sold=? and max_sold is ? and id!=?",
         (chat_id, d["site"], *vals, d.get("edit") or 0),
     ).fetchone()
     if dup:  # такая задача уже есть — запускаем её, чтобы не идти за ней в «Мои задачи»
         was_active = db.execute("select active from tasks where id=?", (dup["id"],)).fetchone()[0]
-        db.execute("update tasks set active=1, started_at=case when active=0 then ? else started_at end where id=?",
+        db.execute("update tasks set active=1, checked=case when active=0 then 0 else checked end, "
+                   "started_at=case when active=0 then ? else started_at end where id=?",
                    (time.time(), dup["id"]))
         db.commit()
         t = db.execute("select * from tasks where id=?", (dup["id"],)).fetchone()
@@ -2320,7 +2596,8 @@ async def finish_task(msg_or_callback, state: FSMContext):
     if tid := d.get("edit"):
         if not db.execute(
             "update tasks set country=?, query=?, pmin=?, pmax=?, max_age=?, min_reviews=?, "
-            "min_account_days=?, contacts_only=?, private_only=?, primed=0, started_at=? where id=? and chat_id=?",
+            "min_account_days=?, contacts_only=?, private_only=?, min_sold=?, max_sold=?, primed=0, checked=0, started_at=? "
+            "where id=? and chat_id=?",
             (*vals, time.time(), tid, chat_id),
         ).rowcount:
             if isinstance(msg_or_callback, Message):
@@ -2335,7 +2612,8 @@ async def finish_task(msg_or_callback, state: FSMContext):
     else:
         tid = db.execute(
             "insert into tasks(chat_id, site, country, query, pmin, pmax, max_age, min_reviews, "
-            "min_account_days, contacts_only, private_only, started_at) values(?,?,?,?,?,?,?,?,?,?,?,?)",
+            "min_account_days, contacts_only, private_only, min_sold, max_sold, started_at) "
+            "values(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (chat_id, d["site"], *vals, time.time()),
         ).lastrowid
         text = "✅ Задача запущена"
@@ -2351,13 +2629,15 @@ async def finish_task(msg_or_callback, state: FSMContext):
                        f"это нормально: бот работает и пришлёт всё, как только площадка выдаст.")
         if t["max_age"] and t["max_age"] < min_age:
             answer_msg += (f"\n⚠️ Свежесть «{AGES.get(t['max_age'])}» здесь будет отсекать часть объявлений — "
-                           f"лучше {AGES.get(min_age)} или больше.")
+                           f"лучше {AGES.get(min_age, f'{min_age} мин')} или больше.")
     for note in proxy_notes(t["site"], (t["country"] or ",".join(COUNTRIES[t["site"]])).split(","), t["chat_id"]):
         answer_msg += "\n\n" + note
     if not split_query(t["query"])[0]:
-        answer_msg += (f"\n\n📋 <b>Все объявления:</b> на крупных площадках это десятки в минуту, а за проверку я шлю "
-                       f"{chat_limit(t['chat_id'])} самых свежих (лимит — /limit), остальные пропускаю. Фильтры продавца "
-                       f"грузят профиль каждого объявления: больше трафика прокси и лимитов площадки.")
+        lim = chat_limit(t["chat_id"])
+        how = (f"за проверку я шлю {lim} самых свежих (лимит — /limit), остальные пропускаю" if lim else
+               "лимита нет (/limit): шлю всё подряд, ~1 карточка в секунду")
+        answer_msg += (f"\n\n📋 <b>Все объявления:</b> на крупных площадках это десятки в минуту, а {how}. "
+                       f"Фильтры продавца грузят профиль каждого объявления: больше трафика прокси и лимитов площадки.")
         if t["site"] == "milanuncios":
             answer_msg += ("\n⚠️ Milanuncios без запроса отдаёт почти одни «поднятые» старые объявления — новых будет "
                            "очень мало. Лучше задать слово.")
@@ -2373,17 +2653,39 @@ async def on_task_button(c: CallbackQuery):
     action, tid, *page = c.data.split(":")
     chat_id = c.message.chat.id
     if action == "toggle":
-        db.execute("update tasks set active=1-active, started_at=case when active=0 then ? else started_at end "
+        db.execute("update tasks set active=1-active, checked=case when active=0 then 0 else checked end, "
+                   "started_at=case when active=0 then ? else started_at end "
                    "where id=? and chat_id=?", (time.time(), tid, chat_id))
     else:
-        if db.execute("delete from tasks where id=? and chat_id=?", (tid, chat_id)).rowcount:
-            db.execute("delete from seen where task_id=?", (tid,))
-            # id без AUTOINCREMENT достанется следующей задаче — чужие статистика и алерты ей не нужны
-            db.execute("update sent set task_id=null where task_id=?", (tid,))
-            for state_by_task in (last_error, alerted, streak):
-                state_by_task.pop(int(tid), None)
+        delete_task(tid, chat_id)
     db.commit()
     await show_list(c, int(page[0]) if page else 0)
+
+
+def delete_task(tid, chat_id):
+    if db.execute("delete from tasks where id=? and chat_id=?", (tid, chat_id)).rowcount:
+        db.execute("delete from seen where task_id=?", (tid,))
+        # отправленное остаётся для «уже присылал», но без привязки к удалённой задаче
+        db.execute("update sent set task_id=null where task_id=?", (tid,))
+        for state_by_task in (last_error, alerted, streak, last_check):
+            state_by_task.pop(int(tid), None)
+
+
+@dp.callback_query(F.data == "delall")
+async def ask_delete_all(c: CallbackQuery):
+    n = db.execute("select count(*) from tasks where chat_id=?", (c.message.chat.id,)).fetchone()[0]
+    await c.message.edit_text(f"Удалить все задачи ({n})? Это нельзя отменить.",
+                              reply_markup=kb([[(f"🗑 Да, удалить все {n}", "delall:yes"), ("Отмена", "list:0")]]))
+    await c.answer()
+
+
+@dp.callback_query(F.data == "delall:yes")
+async def delete_all(c: CallbackQuery):
+    chat_id = c.message.chat.id
+    for (tid,) in db.execute("select id from tasks where chat_id=?", (chat_id,)).fetchall():
+        delete_task(tid, chat_id)
+    db.commit()
+    await show_list(c, 0)
 
 
 @dp.callback_query(F.data.regexp(r"^st(tog)?:\d+$"))
@@ -2391,7 +2693,8 @@ async def on_status(c: CallbackQuery):
     action, tid = c.data.split(":")
     chat_id = c.message.chat.id
     if action == "sttog":
-        db.execute("update tasks set active=1-active, started_at=case when active=0 then ? else started_at end "
+        db.execute("update tasks set active=1-active, checked=case when active=0 then 0 else checked end, "
+                   "started_at=case when active=0 then ? else started_at end "
                    "where id=? and chat_id=?", (time.time(), tid, chat_id))
         db.commit()
     t = db.execute("select * from tasks where id=? and chat_id=?", (tid, chat_id)).fetchone()
@@ -2418,9 +2721,31 @@ async def on_hide_seller(c: CallbackQuery):
     else:
         db.execute("delete from hidden where chat_id=? and site=? and seller=?", (c.message.chat.id, site, seller))
     db.commit()
-    await c.message.edit_reply_markup(reply_markup=seller_kb(site, seller, action == "hide"))
+    rest = c.message.reply_markup.inline_keyboard[1:]  # «Остановить задачу» под карточкой — оставляем как было
+    await c.message.edit_reply_markup(
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb([seller_row(site, seller, action == "hide")]).inline_keyboard + rest))
     await c.answer("Продавец скрыт: его объявления больше не придут в этот чат" if action == "hide"
                    else "Продавец снова показывается")
+
+
+@dp.callback_query(F.data.regexp(r"^(tstop|tstart):\d+$"))
+async def stop_start_task(c: CallbackQuery):
+    action, tid = c.data.split(":")
+    chat_id = c.message.chat.id
+    if action == "tstop":  # check() перед каждой карточкой смотрит active — недосланная пачка тоже обрывается
+        db.execute("update tasks set active=0 where id=? and chat_id=?", (tid, chat_id))
+    else:  # как «Запустить» в списке задач: новые — с этого момента
+        db.execute("update tasks set active=1, checked=0, started_at=? where id=? and chat_id=? and active=0",
+                   (time.time(), tid, chat_id))
+    db.commit()
+    row = db.execute("select active from tasks where id=? and chat_id=?", (tid, chat_id)).fetchone()
+    if row is None:
+        return await c.answer(f"Задача #{tid} удалена.", show_alert=True)
+    # кнопка задачи — последний ряд под карточкой, выше — «Скрыть продавца»
+    rows = c.message.reply_markup.inline_keyboard[:-1]
+    await c.message.edit_reply_markup(
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows + kb([run_row(tid, row[0])]).inline_keyboard))
+    await c.answer(f"▶️ Задача #{tid} запущена" if row[0] else f"⏹️ Задача #{tid} остановлена")
 
 
 @dp.callback_query(F.data.regexp(r"^edit:\d+$"))
@@ -2437,7 +2762,7 @@ async def edit_task(c: CallbackQuery, state: FSMContext):
         "site": site,
         "countries": chosen,
         "edit": t["id"],
-        "old": {k: t[k] for k in ("query", "pmin", "pmax", "max_age", *SELLER_KEYS)},
+        "old": {k: t[k] for k in ("query", "pmin", "pmax", "max_age", *SELLER_KEYS, "min_sold", "max_sold")},
     })
     await state.set_state(New.countries)
     text, markup = countries_prompt(await state.get_data())
@@ -2457,6 +2782,23 @@ async def show_list(c: CallbackQuery, page):
     except TelegramBadRequest:
         pass
     await c.answer()
+
+
+@dp.callback_query()  # последним: сюда попадают только кнопки, которым никто не ответил (старые шаги мастера)
+async def stale_button(c: CallbackQuery):
+    await c.answer("Кнопка устарела — начни заново")
+
+
+@dp.error(F.update.callback_query.as_("c"))
+async def on_callback_error(event: ErrorEvent, c: CallbackQuery):
+    """Упал обработчик кнопки — всё равно отвечаем, иначе кнопка «крутится» бесконечно."""
+    not_modified = isinstance(event.exception, TelegramBadRequest) and "not modified" in str(event.exception)
+    if not not_modified:  # повторное нажатие той же кнопки — не ошибка
+        log.error("кнопка %r упала", c.data, exc_info=event.exception)
+    try:
+        await c.answer(None if not_modified else "⚠️ Не получилось, попробуй ещё раз")
+    except TelegramBadRequest:  # уже ответили до падения
+        pass
 
 
 _instance_lock = socket.socket()  # держим открытым всё время работы: занятый порт = бот уже запущен
